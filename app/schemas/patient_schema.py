@@ -1,12 +1,12 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from .fhir_base_schema import FHIRName, FHIRExtension
 
 class FHIRPatient(BaseModel):
     resourceType:str = "Patient"
     id: str
     name: List[FHIRName]
-    gender: str
+    gender: Optional[str] = "unknown"
     birthDate: str
 
     #AI Custom Variable

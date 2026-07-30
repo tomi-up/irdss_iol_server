@@ -6,6 +6,8 @@ from app.database.db_connection import Base
 from app.models.patient_model import PatientRecords
 from app.models.hospitals import HospitalResources
 from app.models.api_key import APIKey
+from app.models import referral_model
+from app.models.referral_response_model import ReferralResponse
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

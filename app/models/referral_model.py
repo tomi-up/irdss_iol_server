@@ -5,6 +5,7 @@ from sqlalchemy import ForeignKey, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.db_connection import Base
+from app.models.patient_model import PatientRecords
 
 
 class Referral(Base):
@@ -17,16 +18,17 @@ class Referral(Base):
 
     # Foreign Key pointing back to the Patient table's fhir_id
     patient_id: Mapped[str] = mapped_column(
-        ForeignKey("patients.fhir_id", ondelete="CASCADE"),
+        ForeignKey("patient_record.fhir_id", ondelete="CASCADE"),
         nullable=False
     )
     # Operational attributes mapped from the Interoperability Layer (IoL)
     referring_facility: Mapped[str] = mapped_column(String,nullable=False)  # Auto-resolved from the verified API key [1]
-    receiving_facility: Mapped[str] = mapped_column(String, nullable=False)  # Chosen target hospital [2]
+    receiving_facility: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Chosen target hospital [2]
     disease_severity: Mapped[str] = mapped_column(String,nullable=False)  # Clinical categorization (e.g., "A1", "B2") [3]
 
     # Referral lifecycle status tracking (CREATED, SEEN, ACCEPTED, REDIRECTED, ARRIVED) [4]
     status: Mapped[str] = mapped_column(String, default="CREATED", nullable=False)
+    clinical_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     # Performance auditing timestamps to calculate LGU response times [5]
     created_at: Mapped[datetime] = mapped_column(
@@ -43,4 +45,4 @@ class Referral(Base):
 
     # Bidirectional ORM relationship back to Patient
     # We reference the class name as a string to completely prevent circular imports!
-    patient: Mapped["Patient"] = relationship("Patient", back_populates="referrals")
+    patient: Mapped["PatientRecords"] = relationship("PatientRecords", back_populates="referrals")

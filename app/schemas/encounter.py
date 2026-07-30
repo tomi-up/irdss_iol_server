@@ -1,6 +1,7 @@
 from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 from app.schemas.patient_schema import FHIRPatient
+from datetime import datetime
 
 
 # FHIR Reference Schema (e.g. subject)
@@ -91,3 +92,38 @@ class ReferralResponseSchema(BaseModel):
     status: str
     message: str
     referral_tracking_id: str
+
+class IncomingReferralSchema(BaseModel):
+    """
+    Pydantic schema to format the outgoing list of active referral alerts
+    for receiving hospital dashboards [cite: 561].
+    """
+    id: int
+    referral_id: str
+    hospital_name: str
+    response_status: str  # e.g., "PENDING", "SEEN" [cite: 191]
+    seen_at: Optional[datetime] = None
+    responded_at: Optional[datetime] = None
+
+    # Crucial: Enables Pydantic to read SQLAlchemy ORM models directly [cite: 35]
+    model_config = ConfigDict(from_attributes=True)
+
+class IncomingReferralDetailsSchema(IncomingReferralSchema):
+    """
+    Combines your transactional alert fields with the referenced
+    clinical variables on-the-fly for the receiving doctor's modal [cite: 199].
+    """
+    # Dynamic fields resolved relational-style (never stored in responses table!)
+    referring_facility: str
+    disease_severity: str
+    patient_id: str
+    patient_age: int
+    patient_gender: str
+    clinical_reason: Optional[str] = "None"
+
+class ResponsePayloadSchema(BaseModel):
+    """
+    Pydantic schema to validate the decision body sent by the receiving doctor [cite: 563].
+    Must be either "ACCEPTED" or "REDIRECTED" [cite: 191].
+    """
+    decision: str
