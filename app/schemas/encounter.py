@@ -120,6 +120,11 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     patient_age: int
     patient_gender: str
     clinical_reason: Optional[str] = "None"
+    patient_latitude: Optional[float] = None
+    patient_longitude: Optional[float] = None
+    hospital_latitude: Optional[float] = None
+    hospital_longitude: Optional[float] = None
+
 
 class ResponsePayloadSchema(BaseModel):
     """

@@ -4,6 +4,7 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 
+from app.models.hospitals import HospitalResources
 from app.models.referral_model import Referral
 from app.models.referral_response_model import ReferralResponse
 # Import your schemas, database connections, and SQLAlchemy models
@@ -11,7 +12,7 @@ from app.schemas.encounter import ReferralRequestSchema, ReferralResponseSchema,
 from app.models.patient_model import PatientRecords
 from app.models.referral_model import Referral
 from app.models.api_key import APIKey
-from app.utils.security import aes_encrypt
+from app.utils.security import aes_encrypt, aes_decrypt
 from app.database.db_connection import get_db
 from app.ai.routing_filter import get_qualified_broadcast_targets
 
@@ -59,6 +60,12 @@ def get_incoming_referrals(
         db: Session = Depends(get_db),
         current_hospital_name: str = Depends(get_current_hospital)  # Resolved from X-API-Key [cite: 138]
 ):
+    rec_hospital = db.query(HospitalResources).filter(
+        HospitalResources.hospital_name == current_hospital_name
+    ).first()
+
+    hospital_lat = rec_hospital.latitude if rec_hospital else None
+    hospital_long = rec_hospital.longitude if rec_hospital else None
     # Relational Join: Joins referral_responses with referrals and patient_record on-the-fly [cite: 145, 164]
     results = (
         db.query(ReferralResponse,Referral)
@@ -70,10 +77,17 @@ def get_incoming_referrals(
         .all()
     )
 
-    # Bundle the relational attributes directly into the merged output schema
-    return [
-        {
-            # Transactional fields from ReferralResponse (your original schema fields)
+    formatted_responses = []
+    for resp, ref in results:
+        # Safe Decryption Guard: Decrypts if encrypted; falls back to raw string on error [cite: 87]
+        try:
+            readable_patient_id = aes_decrypt(ref.patient_id)
+        except Exception:
+            # If the database row is an unencrypted legacy test record, use it directly [cite: 87]
+            readable_patient_id = ref.patient_id
+
+        formatted_responses.append({
+            # Transactional fields from ReferralResponse [cite: 164]
             "id": resp.id,
             "referral_id": resp.referral_id,
             "hospital_name": resp.hospital_name,
@@ -81,16 +95,20 @@ def get_incoming_referrals(
             "seen_at": resp.seen_at,
             "responded_at": resp.responded_at,
 
-            # Clinical metadata resolved relationally (never persisted in resp table) [cite: 164]
+            # Clinical metadata resolved relationally (never persisted in responses table) [cite: 164]
             "referring_facility": ref.referring_facility,
             "disease_severity": ref.disease_severity,
-            "patient_id": ref.patient_id,
+            "patient_id": readable_patient_id,  # ◄── This now securely decrypted! [cite: 87]
             "patient_age": ref.patient.age,  # Eager-loaded from PatientRecords [cite: 164]
             "patient_gender": ref.patient.gender or "unknown",  # Read direct model column [cite: 164]
-            "clinical_reason": ref.clinical_reason or "No reason provided"
-        }
-        for resp, ref in results
-    ]
+            "clinical_reason": ref.clinical_reason or "No reason provided",
+            "patient_latitude": ref.patient.latitude,  # Origin [cite: 120, 164]
+            "patient_longitude": ref.patient.longitude,  # Origin [cite: 120, 164]
+            "hospital_latitude": hospital_lat,  # Destination [cite: 120]
+            "hospital_longitude": hospital_long
+        })
+
+    return formatted_responses
 
 @router.patch("/api/v1/referral/{referral_id}/respond")
 async def respond_to_referral(
@@ -226,6 +244,8 @@ async def initiate_referral(
         db.refresh(new_referral)
         qualified_hospitals = get_qualified_broadcast_targets(db, patient_severity)
         for hospital in qualified_hospitals:
+            if hospital.hospital_name == referring_hospital:
+                continue
             pending_alert = ReferralResponse(
                 referral_id=new_referral.referral_id,
                 hospital_name=hospital.hospital_name,
