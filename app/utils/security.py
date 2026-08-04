@@ -1,4 +1,5 @@
 import os, pyotp
+import hashlib, secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import jwt
@@ -73,7 +74,7 @@ def aes_decrypt(encrypted_data: str) -> str:
     return decrypted_data.decode('utf-8')
 
 
-import hashlib, secrets
+
 
 def hash_api_key(key: str) -> str:
     """
@@ -145,4 +146,4 @@ def generate_irdss_api_key(hospital_name: str = "") -> tuple[str, str]:
     return raw_key, hashed_key
 
 
-
+

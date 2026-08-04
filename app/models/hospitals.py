@@ -14,3 +14,7 @@ class HospitalResources(Base):
     medical_equipment = Column(Boolean)
     communication_systems = Column(Boolean)
     medical_specialists_count = Column(Integer)
+    # The optimized target calculated by your background PSO job [cite: 110]
+    pso_daily_routing_limit = Column(Integer, default=5)
+    # Current daily acceptances (resets to 0 every midnight) [cite: 110]
+    referrals_accepted_today = Column(Integer, default=0)

@@ -259,9 +259,52 @@ async def initiate_referral(
         return ReferralResponseSchema(
             status="success",
             message="Referral securely verified, split, and logged in the central IoL queue.",
-            referral_tracking_id=new_referral.referral_id
+            referral_tracking_id=new_referral.referral_id,
+            referral_id=new_referral.referral_id
         )
+
 
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to process referral: {str(e)}")
+
+
+@router.get("/api/v1/referral/{referral_id}/recommendations")
+def get_baseline_recommendations(
+    referral_id: str,
+    db: Session = Depends(get_db)
+):
+    # 1. Grab all response records where the hospital clicked ACCEPT
+    accepted_responses = db.query(ReferralResponse).filter(
+        ReferralResponse.referral_id == referral_id,
+        ReferralResponse.response_status == "ACCEPTED"
+    ).all()
+
+    # 2. If no one has accepted yet, return an empty list
+    if not accepted_responses:
+        return []
+
+    # 3. Pull the hospital names that accepted
+    accepted_hospital_names = [resp.hospital_name for resp in accepted_responses]
+
+    # 4. Resolve their resources (coordinates, level, available beds)
+    hospitals = db.query(HospitalResources).filter(
+        HospitalResources.hospital_name.in_(accepted_hospital_names)
+    ).all()
+
+    # 5. Return the raw list to the frontend (Baseline placeholder!)
+    # Since FCM is not implemented yet, we just return them sorted by available beds
+    baseline_list = []
+    for h in hospitals:
+        baseline_list.append({
+            "hospital_name": h.hospital_name,
+            "hospital_level": h.hospital_level,
+            "available_beds": h.available_beds,
+            "latitude": h.latitude,
+            "longitude": h.longitude,
+            "matching_degree": 1.0  # Placeholder matching score of 100%
+        })
+
+    # Sort by available beds descending as a simple temporary ranking rule
+    baseline_list.sort(key=lambda x: x["available_beds"], reverse=True)
+    return baseline_list

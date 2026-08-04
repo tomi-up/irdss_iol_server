@@ -92,6 +92,8 @@ class ReferralResponseSchema(BaseModel):
     status: str
     message: str
     referral_tracking_id: str
+    referral_id: Optional[str] = None
+
 
 class IncomingReferralSchema(BaseModel):
     """
