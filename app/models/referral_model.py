@@ -26,6 +26,10 @@ class Referral(Base):
     receiving_facility: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Chosen target hospital [2]
     disease_severity: Mapped[str] = mapped_column(String,nullable=False)  # Clinical categorization (e.g., "A1", "B2") [3]
 
+    # Non-reversible SHA-256 hash of (Full Name + Birthdate + Sex), lets the central IoL track
+    # whether a patient already has an active referral network-wide without storing their PII [cite: 13, 110, 184]
+    patient_code: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+
     # Referral lifecycle status tracking (CREATED, SEEN, ACCEPTED, REDIRECTED, ARRIVED) [4]
     status: Mapped[str] = mapped_column(String, default="CREATED", nullable=False)
     clinical_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)

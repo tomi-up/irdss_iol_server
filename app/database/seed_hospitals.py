@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.models.hospitals import HospitalResources
 from app.models.api_key import APIKey
 from app.database.db_connection import SessionLocal
-from app.utils.security import hash_api_key
+from app.utils.security import hash_api_key, mask_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ def seed_hospitals_and_keys(db: Session = None):
                 api_key_rec = APIKey(
                     hospital_name=name,
                     api_key=hashed_key_val,
+                    api_key_display=mask_api_key(raw_key_val),
                     is_active=True
                 )
                 db.add(api_key_rec)

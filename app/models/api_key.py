@@ -8,5 +8,6 @@ class APIKey(Base):
     id = Column(Integer, primary_key=True, index=True)
     hospital_name = Column(String, index=True, nullable=False)
     api_key = Column(String, unique=True, index=True, nullable=False)
+    api_key_display = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

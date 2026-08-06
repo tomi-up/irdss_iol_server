@@ -126,6 +126,8 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     patient_longitude: Optional[float] = None
     hospital_latitude: Optional[float] = None
     hospital_longitude: Optional[float] = None
+    referring_facility_latitude: Optional[float] = None
+    referring_facility_longitude: Optional[float] = None
 
 
 class ResponsePayloadSchema(BaseModel):
@@ -134,3 +136,11 @@ class ResponsePayloadSchema(BaseModel):
     Must be either "ACCEPTED" or "REDIRECTED" [cite: 191].
     """
     decision: str
+
+
+class FinalizeReferralSchema(BaseModel):
+    """
+    Pydantic schema for the referring doctor's final destination choice, locking in
+    the patient's clinical pathway among the hospitals that accepted the referral.
+    """
+    hospital_name: str

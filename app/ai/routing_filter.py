@@ -1,14 +1,19 @@
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.hospitals import HospitalResources
 
 def get_qualified_broadcast_targets(db: Session, patient_severity: int) -> list[HospitalResources]:
     """
     Executes a fast, rule-based clinical check to identify qualified candidate
-    hospitals that have available beds and match the patient's triage severity [cite: 95, 99].
+    hospitals that have available beds, match the patient's triage severity, and
+    have not yet exhausted their PSO-computed daily routing capacity [cite: 95, 99, 110].
     """
     # 1. Establish the base query
     query = db.query(HospitalResources).filter(
-        HospitalResources.available_beds > 0  # Hospital must have bed space
+        HospitalResources.available_beds > 0,  # Hospital must have bed space
+        # PSO daily capacity gate: skip hospitals that already hit today's accepted-referral cap [cite: 110]
+        func.coalesce(HospitalResources.referrals_accepted_today, 0)
+        < func.coalesce(HospitalResources.pso_daily_routing_limit, 5)
     )
 
     # 2. Apply clinical triage constraints:
