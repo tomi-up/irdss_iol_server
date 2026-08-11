@@ -63,6 +63,14 @@ async def enforce_default_rate_limit(request: Request, call_next):
     return await call_next(request)
 
 
+# Polling these from the Monitoring page's own auto-refresh would otherwise write
+# entries about themselves into the very buffer they're displaying, crowding out
+# real hospital/referral traffic purely by being the most frequent caller. The
+# DELETE (flush) on /system/logs is a deliberate, infrequent admin action, not
+# passive polling, so it's still logged.
+_UNLOGGED_GET_PATHS = {"/api/v1/admin/system/health", "/api/v1/admin/system/logs"}
+
+
 @app.middleware("http")
 async def monitor_requests(request: Request, call_next):
     """
@@ -70,6 +78,9 @@ async def monitor_requests(request: Request, call_next):
     the Admin Panel's server-log viewer. Never swallows the underlying exception:
     failures are logged as HTTP 500 entries and then re-raised untouched.
     """
+    if request.method == "GET" and request.url.path in _UNLOGGED_GET_PATHS:
+        return await call_next(request)
+
     started = time.perf_counter()
     client_ip = request.client.host if request.client else None
 
