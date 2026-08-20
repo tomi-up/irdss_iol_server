@@ -126,6 +126,11 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     clinical_reason: Optional[str] = "None"
     diagnosis: Optional[str] = None
     chief_complaint: Optional[str] = None
+    is_pwd: bool = False
+    is_pregnant: bool = False
+    is_senior_citizen: bool = False
+    has_allergy: bool = False
+    allergy_details: Optional[str] = None
     patient_latitude: Optional[float] = None
     patient_longitude: Optional[float] = None
     hospital_latitude: Optional[float] = None

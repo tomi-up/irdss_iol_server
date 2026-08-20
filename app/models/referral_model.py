@@ -63,6 +63,16 @@ class Referral(Base):
     vital_rr: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     vital_temp_c: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     vital_o2sat: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    vital_height_cm: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    vital_weight_kg: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Patient status flags entered by the referring doctor/nurse at referral time --
+    # relevant to how the receiving facility triages/accepts, not just post-acceptance viewing
+    is_pwd: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_pregnant: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_senior_citizen: Mapped[bool] = mapped_column(default=False, nullable=False)
+    has_allergy: Mapped[bool] = mapped_column(default=False, nullable=False)
+    allergy_details: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     # Performance auditing timestamps to calculate LGU response times [5]
     created_at: Mapped[datetime] = mapped_column(

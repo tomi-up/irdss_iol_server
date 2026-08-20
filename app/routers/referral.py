@@ -144,6 +144,11 @@ def get_incoming_referrals(
             "clinical_reason": ref.clinical_reason or "No reason provided",
             "diagnosis": ref.diagnosis,
             "chief_complaint": ref.chief_complaint,
+            "is_pwd": ref.is_pwd,
+            "is_pregnant": ref.is_pregnant,
+            "is_senior_citizen": ref.is_senior_citizen,
+            "has_allergy": ref.has_allergy,
+            "allergy_details": ref.allergy_details,
             "patient_latitude": ref.patient.latitude,  # Origin [cite: 120, 164]
             "patient_longitude": ref.patient.longitude,  # Origin [cite: 120, 164]
             "hospital_latitude": hospital_lat,  # Destination [cite: 120]
@@ -299,6 +304,13 @@ async def initiate_referral(
         vital_rr = None
         vital_temp_c = None
         vital_o2sat = None
+        vital_height_cm = None
+        vital_weight_kg = None
+        is_pwd = False
+        is_pregnant = False
+        is_senior_citizen = False
+        has_allergy = False
+        allergy_details = None
 
         if payload.patient_record.extension:
             for ext in payload.patient_record.extension:
@@ -332,6 +344,20 @@ async def initiate_referral(
                     vital_temp_c = str(ext.valueDecimal) if ext.valueDecimal is not None else None
                 elif "vitalOxygenSaturation" in ext.url:
                     vital_o2sat = str(int(ext.valueDecimal)) if ext.valueDecimal is not None else None
+                elif "vitalHeight" in ext.url:
+                    vital_height_cm = str(ext.valueDecimal) if ext.valueDecimal is not None else None
+                elif "vitalWeight" in ext.url:
+                    vital_weight_kg = str(ext.valueDecimal) if ext.valueDecimal is not None else None
+                elif "isPwd" in ext.url:
+                    is_pwd = bool(ext.valueBoolean)
+                elif "isPregnant" in ext.url:
+                    is_pregnant = bool(ext.valueBoolean)
+                elif "isSeniorCitizen" in ext.url:
+                    is_senior_citizen = bool(ext.valueBoolean)
+                elif "hasAllergy" in ext.url:
+                    has_allergy = bool(ext.valueBoolean)
+                elif "allergyDetails" in ext.url:
+                    allergy_details = ext.valueString
 
         # Step C.0: Derive which specific facility capabilities (dialysis, OB delivery,
         # neurology, etc.) this diagnosis requires, on top of the baseline severity tier
@@ -427,6 +453,13 @@ async def initiate_referral(
             vital_rr=vital_rr,
             vital_temp_c=vital_temp_c,
             vital_o2sat=vital_o2sat,
+            vital_height_cm=vital_height_cm,
+            vital_weight_kg=vital_weight_kg,
+            is_pwd=is_pwd,
+            is_pregnant=is_pregnant,
+            is_senior_citizen=is_senior_citizen,
+            has_allergy=has_allergy,
+            allergy_details=allergy_details,
             status="CREATED",
             created_at=datetime.now(timezone.utc)
         )
@@ -809,6 +842,13 @@ def get_referral_patient_details(
         "vital_rr": referral.vital_rr,
         "vital_temp_c": referral.vital_temp_c,
         "vital_o2sat": referral.vital_o2sat,
+        "vital_height_cm": referral.vital_height_cm,
+        "vital_weight_kg": referral.vital_weight_kg,
+        "is_pwd": referral.is_pwd,
+        "is_pregnant": referral.is_pregnant,
+        "is_senior_citizen": referral.is_senior_citizen,
+        "has_allergy": referral.has_allergy,
+        "allergy_details": referral.allergy_details,
     }
 
 

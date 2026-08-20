@@ -11,4 +11,5 @@ class FHIRExtension(BaseModel):
     url:str
     valueDecimal:Optional[float] = None
     valueString:Optional[str] = None
+    valueBoolean:Optional[bool] = None
 
