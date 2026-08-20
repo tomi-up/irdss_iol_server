@@ -7,10 +7,11 @@ import irdssLogo from '../assets/irdss-logo.png'
 const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: LayoutGrid, end: true },
   { to: '/referrals', label: 'All Referrals', icon: Repeat },
-  { to: '/hospitals', label: 'Hospitals', icon: Building2 },
-  { to: '/api-keys', label: 'API Keys', icon: KeyRound },
+  { to: '/hospitals', label: 'Health Facilities', icon: Building2 },
+  { to: '/credentials', label: 'Facility Credentials', icon: KeyRound },
   { to: '/monitoring', label: 'Server Monitoring', icon: Activity },
 ]
+
 
 // Persistent app shell: dark sidebar matching the mock_hospitals HIS exactly (gray-900,
 // yellow-600 active pill), a light top bar for identity/sign-out, and the routed outlet.

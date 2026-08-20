@@ -110,9 +110,23 @@ async def monitor_requests(request: Request, call_next):
     return response
 
 
-# Register the external routers that the LGU IT teams will call
+from fastapi.staticfiles import StaticFiles
+import os
+
+from app.routers import admin, admin_auth, referral, hospitals, facility_auth, assessments
+
+# Ensure storage directory exists for LTO file uploads
+os.makedirs("storage/lto_files", exist_ok=True)
+app.mount("/storage/lto_files", StaticFiles(directory="storage/lto_files"), name="lto_files")
+
+# Register all application route modules
+app.include_router(admin.router)
+app.include_router(admin_auth.router)
+app.include_router(facility_auth.router)
 app.include_router(referral.router)
 app.include_router(hospitals.router)
+app.include_router(assessments.router)
+
 
 # Register the internal SYSTEM_ADMIN control plane consumed by admin_frontend.
 # admin_auth (login/2fa) is intentionally registered separately from admin —
@@ -124,3 +138,4 @@ app.include_router(admin.router)
 @app.get("/")
 async def root():
     return {"message": "Welcome to the IRDSS Interoperability Layer API. The server is live and secure."}
+

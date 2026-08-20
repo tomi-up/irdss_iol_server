@@ -16,6 +16,9 @@ class PatientRecords(Base):
 
     # Patient demographic and clinical variables for the FCM matchmaking core [cite: 94]
     age: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Precise age in whole months (e.g. 6 for a 6-month-old) -- `age` alone floors to 0 for
+    # any infant under a year, which is clinically meaningless on a triage alert
+    age_months: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     salary: Mapped[Optional[float]] = mapped_column(Float,nullable=True)  # Expected out-of-pocket budget limit [cite: 94]
     severity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Clinical triaging category [cite: 94]
     latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

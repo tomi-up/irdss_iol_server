@@ -6,18 +6,23 @@ environment root key or an active SYSTEM_ADMIN credential. These are the only
 endpoints in the gateway that intentionally read across tenant boundaries.
 """
 
+import os
 import time
+import uuid
+import secrets
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from app.database.db_connection import engine, get_db
 from app.models.api_key import APIKey
-from app.models.hospitals import HospitalResources
+from app.models.hospitals import Facility, HospitalResources
+from app.models.facility_capability import FacilityCapability
+from app.models.facility_user import FacilityUser
 from app.models.patient_model import PatientRecords
 from app.models.referral_model import Referral
 from app.models.referral_response_model import ReferralResponse
@@ -28,6 +33,13 @@ from app.schemas.admin_schema import (
     AdminApiKeyIssuedResponse,
     AdminApiKeyItem,
     AdminApiKeyUpdate,
+    AdminFacilityCreate,
+    AdminFacilityCredentialsCreate,
+    AdminFacilityCredentialsIssuedResponse,
+    AdminFacilityCredentialsItem,
+    AdminFacilityItem,
+
+    AdminFacilityUpdate,
     AdminHospitalCreate,
     AdminHospitalItem,
     AdminHospitalUpdate,
@@ -51,7 +63,12 @@ from app.utils.request_log import (
     get_traffic_summary,
     get_uptime_seconds,
 )
-from app.utils.security import aes_decrypt, generate_irdss_api_key, verify_admin_key
+from app.utils.security import (
+    aes_decrypt,
+    generate_irdss_api_key,
+    get_password_hash,
+    verify_admin_key,
+)
 
 router = APIRouter(
     prefix="/api/v1/admin",
@@ -98,21 +115,18 @@ def _build_referral_item(
         clinical_reason=referral.clinical_reason,
         status=_compute_referral_status(referral, responses),
         broadcast_count=len(responses),
-        accepted_count=len([r for r in responses if r.response_status == "ACCEPTED"]),
+        accepted_count=sum(1 for r in responses if r.response_status == "ACCEPTED"),
         created_at=referral.created_at,
-        seen_at=referral.seen_at,
-        evaluated_at=referral.evaluated_at,
+        seen_at=min((r.seen_at for r in responses if r.seen_at), default=None),
+        evaluated_at=min((r.responded_at for r in responses if r.responded_at), default=None),
     )
 
 
-# IDENTITY
-
-
-@router.get("/me", response_model=AdminIdentitySchema, summary="Validate the supplied admin key")
-def get_admin_identity(admin: str = Depends(verify_admin_key)) -> AdminIdentitySchema:
-    """Lightweight probe the admin panel calls on login to confirm a pasted key is valid."""
+@router.get("/me", response_model=AdminIdentitySchema, summary="Validate admin authentication")
+def get_admin_identity(request_identity: str = Depends(verify_admin_key)) -> AdminIdentitySchema:
+    """Echoes back the caller's admin identity so the panel can confirm the token/key is valid."""
     return AdminIdentitySchema(
-        hospital_name=admin,
+        hospital_name=request_identity,
         is_admin=True,
         server_time=datetime.now(timezone.utc),
     )
@@ -121,20 +135,20 @@ def get_admin_identity(admin: str = Depends(verify_admin_key)) -> AdminIdentityS
 # DASHBOARD STATISTICS
 
 
-@router.get("/stats", response_model=AdminStatsResponse, summary="Network-wide KPI snapshot")
+@router.get("/stats", response_model=AdminStatsResponse, summary="Dashboard high-level metrics")
 def get_admin_stats(db: Session = Depends(get_db)) -> AdminStatsResponse:
-    """Aggregates referral volume, lifecycle mix, and facility/key counts for the admin dashboard."""
+    """Computes network-wide referral volumes, response times, and facility totals."""
     try:
-        referrals = db.query(Referral).all()
-        all_responses = db.query(ReferralResponse).all()
-
-        responses_by_referral: dict[str, list[ReferralResponse]] = {}
-        for resp in all_responses:
-            responses_by_referral.setdefault(resp.referral_id, []).append(resp)
-
         now = datetime.now(timezone.utc)
         today = now.date()
         week_ago = now - timedelta(days=7)
+
+        referrals = db.query(Referral).all()
+        responses = db.query(ReferralResponse).all()
+
+        responses_by_referral: dict[str, list[ReferralResponse]] = {}
+        for r in responses:
+            responses_by_referral.setdefault(r.referral_id, []).append(r)
 
         status_counter: Counter = Counter()
         severity_counter: Counter = Counter()
@@ -158,7 +172,6 @@ def get_admin_stats(db: Session = Depends(get_db)) -> AdminStatsResponse:
 
             created = ref.created_at
             if created is not None:
-                # Referral.created_at is stored naive-UTC; normalize before comparing.
                 created_aware = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
                 if created_aware.date() == today:
                     referrals_today += 1
@@ -174,15 +187,20 @@ def get_admin_stats(db: Session = Depends(get_db)) -> AdminStatsResponse:
                     if delta >= 0:
                         turnaround_minutes.append(delta)
 
-        # Fill the 7-day series so the chart never has holes.
         daily_volume = []
         for offset in range(6, -1, -1):
             day = (now - timedelta(days=offset)).date().isoformat()
             daily_volume.append(DailyVolumeItem(date=day, count=daily_counter.get(day, 0)))
 
-        hospitals = db.query(HospitalResources).all()
+        facilities = db.query(Facility).all()
+        capabilities = db.query(FacilityCapability).all()
+        total_beds = sum((c.functional_beds or 0) for c in capabilities)
+
         total_keys = db.query(func.count(APIKey.id)).scalar() or 0
         active_keys = db.query(func.count(APIKey.id)).filter(APIKey.is_active == True).scalar() or 0
+
+        total_creds = db.query(func.count(FacilityUser.id)).scalar() or 0
+        issued_creds = db.query(func.count(FacilityUser.id)).filter(FacilityUser.status == "Active").scalar() or 0
 
         avg_response = round(sum(turnaround_minutes) / len(turnaround_minutes), 2) if turnaround_minutes else None
 
@@ -193,10 +211,13 @@ def get_admin_stats(db: Session = Depends(get_db)) -> AdminStatsResponse:
             active_referrals=status_counter.get("PENDING", 0) + status_counter.get("SEEN", 0),
             completed_referrals=status_counter.get("ACCEPTED", 0),
             cancelled_referrals=status_counter.get("CANCELLED", 0),
-            total_hospitals=len(hospitals),
-            total_available_beds=sum((h.available_beds or 0) for h in hospitals),
+            total_hospitals=len(facilities),
+            total_available_beds=total_beds,
+            total_credentials=total_creds,
+            issued_credentials=issued_creds,
             total_api_keys=total_keys,
             active_api_keys=active_keys,
+
             avg_response_minutes=avg_response,
             status_breakdown=[StatusCountItem(label=k, count=v) for k, v in status_counter.most_common()],
             severity_breakdown=[StatusCountItem(label=k, count=v) for k, v in severity_counter.most_common()],
@@ -251,38 +272,43 @@ def list_all_referrals(
         referral_ids = [r.referral_id for r in referrals]
         responses_by_referral: dict[str, list[ReferralResponse]] = {}
         if referral_ids:
-            for resp in db.query(ReferralResponse).filter(ReferralResponse.referral_id.in_(referral_ids)).all():
+            all_responses = db.query(ReferralResponse).filter(
+                ReferralResponse.referral_id.in_(referral_ids)
+            ).all()
+            for resp in all_responses:
                 responses_by_referral.setdefault(resp.referral_id, []).append(resp)
 
-        items = [
-            _build_referral_item(ref, responses_by_referral.get(ref.referral_id, []), ref.patient)
-            for ref in referrals
-        ]
+        items = []
+        for ref in referrals:
+            resp_list = responses_by_referral.get(ref.referral_id, [])
+            computed_status = _compute_referral_status(ref, resp_list)
 
-        # Status is derived from response rows, so it must be filtered after assembly.
-        if status_filter:
-            wanted = status_filter.strip().upper()
-            items = [i for i in items if i.status == wanted]
+            if status_filter and computed_status != status_filter.upper():
+                continue
+
+            items.append(_build_referral_item(ref, resp_list, ref.patient))
 
         total = len(items)
         start = (page - 1) * page_size
+        paged_items = items[start:start + page_size]
+
         return AdminReferralListResponse(
             total=total,
             page=page,
             page_size=page_size,
-            items=items[start:start + page_size],
+            items=paged_items,
         )
 
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list referrals: {str(e)}"
+            detail=f"Failed to fetch referral records: {str(e)}"
         )
 
 
-@router.get("/referrals/{referral_id}", response_model=AdminReferralDetail, summary="Full referral audit trail")
+@router.get("/referrals/{referral_id}", response_model=AdminReferralDetail, summary="Get full referral audit view")
 def get_referral_detail(referral_id: str, db: Session = Depends(get_db)) -> AdminReferralDetail:
-    """Returns one referral with its patient context and the complete per-hospital response timeline."""
+    """Returns detailed referral record including all candidate response timestamps."""
     referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
     if not referral:
         raise HTTPException(
@@ -343,63 +369,150 @@ def admin_cancel_referral(referral_id: str, db: Session = Depends(get_db)) -> Ac
         )
 
 
-# HOSPITAL MANAGEMENT
+# FACILITY MANAGEMENT
 
 
-@router.get("/hospitals", response_model=list[AdminHospitalItem], summary="List all hospital nodes")
-def list_all_hospitals(
+@router.get("/facilities", response_model=list[AdminFacilityItem], summary="List all registered facilities")
+def list_all_facilities(
     db: Session = Depends(get_db),
-    search: Optional[str] = Query(None),
-) -> list[AdminHospitalItem]:
-    """Returns every registered hospital resource record, flagged with whether it holds an active API key."""
-    query = db.query(HospitalResources)
-    if search:
-        query = query.filter(HospitalResources.hospital_name.ilike(f"%{search.strip()}%"))
+    search: Optional[str] = None,
+) -> list[AdminFacilityItem]:
+    """Returns all registered health facility records, flagged with API key and login credential availability."""
+    query = db.query(Facility)
+    if search and isinstance(search, str):
+        query = query.filter(Facility.facility_name.ilike(f"%{search.strip()}%"))
 
-    hospitals = query.order_by(HospitalResources.hospital_name.asc()).all()
+
+    facilities = query.order_by(Facility.facility_name.asc()).all()
 
     keyed_names = {
         name.strip().lower()
         for (name,) in db.query(APIKey.hospital_name).filter(APIKey.is_active == True).all()
     }
 
+    facility_users_map = {
+        fu.facility_id: fu.username
+        for fu in db.query(FacilityUser).all()
+    }
+
     items = []
-    for h in hospitals:
-        item = AdminHospitalItem.model_validate(h)
-        item.has_api_key = (h.hospital_name or "").strip().lower() in keyed_names
+    for f in facilities:
+        item = AdminFacilityItem.model_validate(f)
+        item.has_api_key = (f.facility_name or "").strip().lower() in keyed_names
+        item.has_facility_user = f.id in facility_users_map
+        item.facility_username = facility_users_map.get(f.id)
         items.append(item)
     return items
 
 
 @router.post(
-    "/hospitals",
-    response_model=AdminHospitalItem,
+    "/facilities",
+    response_model=AdminFacilityItem,
     status_code=status.HTTP_201_CREATED,
-    summary="Register a new hospital node"
+    summary="Register a new facility"
 )
-def create_hospital(payload: AdminHospitalCreate, db: Session = Depends(get_db)) -> AdminHospitalItem:
-    """Provisions a new hospital resource record directly from the admin panel."""
+async def create_facility(
+    facility_name: str = Form(...),
+    facility_type: str = Form("Level 1 Hospital"),
+    ownership: str = Form("Government"),
+    facility_head: Optional[str] = Form(None),
+    region: Optional[str] = Form(None),
+    province: Optional[str] = Form(None),
+    municipality: Optional[str] = Form(None),
+    barangay: Optional[str] = Form(None),
+    address: Optional[str] = Form(None),
+    latitude: Optional[float] = Form(0.0),
+    longitude: Optional[float] = Form(0.0),
+    contact_number: Optional[str] = Form(None),
+    email: Optional[str] = Form(None),
+    lto_number: Optional[str] = Form(None),
+    lto_type: Optional[str] = Form(None),
+    lto_issue_date: Optional[str] = Form(None),
+    lto_expiration_date: Optional[str] = Form(None),
+    lto_status: Optional[str] = Form("Active"),
+    facility_status: str = Form("Active"),
+    pso_daily_routing_limit: int = Form(5),
+    lto_file: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db)
+) -> AdminFacilityItem:
+    """Provisions a new facility record with optional LTO license document attachment."""
     try:
-        existing = db.query(HospitalResources).filter(
-            HospitalResources.hospital_name.ilike(payload.hospital_name.strip())
+        existing = db.query(Facility).filter(
+            Facility.facility_name.ilike(facility_name.strip())
         ).first()
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Hospital '{payload.hospital_name}' already exists (ID {existing.id})."
+                detail=f"Facility '{facility_name}' already exists (ID {existing.id})."
             )
 
-        hospital = HospitalResources(
-            **payload.model_dump(),
+        saved_file_path = None
+        if lto_file and lto_file.filename:
+            storage_dir = os.path.join("storage", "lto_files")
+            os.makedirs(storage_dir, exist_ok=True)
+            ext = os.path.splitext(lto_file.filename)[1]
+            unique_filename = f"{uuid.uuid4().hex}{ext}"
+            full_path = os.path.join(storage_dir, unique_filename)
+            contents = await lto_file.read()
+            with open(full_path, "wb") as f:
+                f.write(contents)
+            saved_file_path = f"/storage/lto_files/{unique_filename}"
+
+        # Parse date fields if supplied
+        parsed_issue_date = None
+        if lto_issue_date:
+            try:
+                parsed_issue_date = datetime.strptime(lto_issue_date, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        parsed_exp_date = None
+        if lto_expiration_date:
+            try:
+                parsed_exp_date = datetime.strptime(lto_expiration_date, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        facility = Facility(
+            facility_name=facility_name.strip(),
+            facility_type=facility_type,
+            ownership=ownership,
+            facility_head=facility_head,
+            region=region,
+            province=province,
+            municipality=municipality,
+            barangay=barangay,
+            address=address,
+            latitude=latitude,
+            longitude=longitude,
+            contact_number=contact_number,
+            email=email,
+            lto_number=lto_number,
+            lto_type=lto_type,
+            lto_issue_date=parsed_issue_date,
+            lto_expiration_date=parsed_exp_date,
+            lto_status=lto_status,
+            lto_file_path=saved_file_path,
+            facility_status=facility_status,
+            pso_daily_routing_limit=pso_daily_routing_limit,
             referrals_accepted_today=0,
         )
-        hospital.hospital_name = payload.hospital_name.strip()
 
-        db.add(hospital)
+        db.add(facility)
+        db.flush()
+        facility.facility_code = f"FAC-{facility.id:06d}"
+
+        # Provision default capability row
+        cap = FacilityCapability(facility_id=facility.id)
+        db.add(cap)
+
         db.commit()
-        db.refresh(hospital)
+        db.refresh(facility)
 
-        return AdminHospitalItem.model_validate(hospital)
+        item = AdminFacilityItem.model_validate(facility)
+        item.has_api_key = False
+        item.has_facility_user = False
+        return item
 
     except HTTPException:
         db.rollback()
@@ -408,46 +521,62 @@ def create_hospital(payload: AdminHospitalCreate, db: Session = Depends(get_db))
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create hospital: {str(e)}"
+            detail=f"Failed to create facility: {str(e)}"
         )
 
 
-@router.patch("/hospitals/{hospital_id}", response_model=AdminHospitalItem, summary="Update a hospital node")
-def update_hospital(
-    hospital_id: int,
-    payload: AdminHospitalUpdate,
+@router.patch("/facilities/{facility_id}", response_model=AdminFacilityItem, summary="Update a facility")
+async def update_facility(
+    facility_id: int,
+    payload: AdminFacilityUpdate,
     db: Session = Depends(get_db)
-) -> AdminHospitalItem:
-    """Applies a partial update to any hospital's resource record, bypassing tenant scoping."""
+) -> AdminFacilityItem:
+    """Applies a partial update to any facility's record."""
     try:
-        hospital = db.query(HospitalResources).filter(HospitalResources.id == hospital_id).first()
-        if not hospital:
+        facility = db.query(Facility).filter(Facility.id == facility_id).first()
+        if not facility:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Hospital record with ID {hospital_id} not found."
+                detail=f"Facility record with ID {facility_id} not found."
             )
 
         update_data = payload.model_dump(exclude_unset=True)
 
-        new_name = update_data.get("hospital_name")
-        if new_name and new_name.strip().lower() != (hospital.hospital_name or "").strip().lower():
-            clash = db.query(HospitalResources).filter(
-                HospitalResources.hospital_name.ilike(new_name.strip()),
-                HospitalResources.id != hospital_id
+        new_name = update_data.get("facility_name")
+        if new_name and new_name.strip().lower() != (facility.facility_name or "").strip().lower():
+            clash = db.query(Facility).filter(
+                Facility.facility_name.ilike(new_name.strip()),
+                Facility.id != facility_id
             ).first()
             if clash:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Another hospital already uses the name '{new_name}'."
+                    detail=f"Another facility already uses the name '{new_name}'."
                 )
 
         for field, value in update_data.items():
             if value is not None:
-                setattr(hospital, field, value.strip() if field == "hospital_name" else value)
+                if field in ("lto_issue_date", "lto_expiration_date") and isinstance(value, str):
+                    try:
+                        value = datetime.strptime(value, "%Y-%m-%d").date()
+                    except ValueError:
+                        pass
+                setattr(facility, field, value.strip() if isinstance(value, str) else value)
 
         db.commit()
-        db.refresh(hospital)
-        return AdminHospitalItem.model_validate(hospital)
+        db.refresh(facility)
+
+        keyed = db.query(APIKey).filter(
+            APIKey.hospital_name.ilike(facility.facility_name),
+            APIKey.is_active == True
+        ).first()
+        fuser = db.query(FacilityUser).filter(FacilityUser.facility_id == facility.id).first()
+
+        item = AdminFacilityItem.model_validate(facility)
+        item.has_api_key = bool(keyed)
+        item.has_facility_user = bool(fuser)
+        item.facility_username = fuser.username if fuser else None
+        return item
 
     except HTTPException:
         db.rollback()
@@ -456,22 +585,22 @@ def update_hospital(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update hospital: {str(e)}"
+            detail=f"Failed to update facility: {str(e)}"
         )
 
 
-@router.delete("/hospitals/{hospital_id}", response_model=ActionResponse, summary="Remove a hospital node")
-def delete_hospital(hospital_id: int, db: Session = Depends(get_db)) -> ActionResponse:
-    """Deletes a hospital resource record, refusing while it still has referral history on file."""
+@router.delete("/facilities/{facility_id}", response_model=ActionResponse, summary="Remove a facility")
+def delete_facility(facility_id: int, db: Session = Depends(get_db)) -> ActionResponse:
+    """Deletes a facility record, refusing while it still has referral history on file."""
     try:
-        hospital = db.query(HospitalResources).filter(HospitalResources.id == hospital_id).first()
-        if not hospital:
+        facility = db.query(Facility).filter(Facility.id == facility_id).first()
+        if not facility:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Hospital record with ID {hospital_id} not found."
+                detail=f"Facility record with ID {facility_id} not found."
             )
 
-        name = hospital.hospital_name
+        name = facility.facility_name
         referral_count = db.query(func.count(Referral.referral_id)).filter(
             or_(Referral.referring_facility.ilike(name), Referral.receiving_facility.ilike(name))
         ).scalar() or 0
@@ -481,13 +610,13 @@ def delete_hospital(hospital_id: int, db: Session = Depends(get_db)) -> ActionRe
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     f"Cannot delete '{name}': it is referenced by {referral_count} referral(s). "
-                    "Deactivate its API key instead to take it offline."
+                    "Deactivate its status instead."
                 )
             )
 
-        db.delete(hospital)
+        db.delete(facility)
         db.commit()
-        return ActionResponse(message=f"Hospital '{name}' was deleted.")
+        return ActionResponse(message=f"Facility '{name}' was deleted.")
 
     except HTTPException:
         db.rollback()
@@ -496,8 +625,194 @@ def delete_hospital(hospital_id: int, db: Session = Depends(get_db)) -> ActionRe
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete hospital: {str(e)}"
+            detail=f"Failed to delete facility: {str(e)}"
         )
+
+
+@router.post(
+    "/facilities/{facility_id}/credentials",
+    response_model=AdminFacilityCredentialsIssuedResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Issue or reset facility admin credentials"
+)
+def issue_facility_credentials(
+    facility_id: int,
+    payload: Optional[AdminFacilityCredentialsCreate] = None,
+    db: Session = Depends(get_db)
+) -> AdminFacilityCredentialsIssuedResponse:
+    """
+    Issues or resets login credentials for a facility admin user.
+    The plain password is returned ONLY in this response and never stored plaintext.
+    """
+    try:
+        facility = db.query(Facility).filter(Facility.id == facility_id).first()
+        if not facility:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Facility with ID {facility_id} not found."
+            )
+
+        existing_user = db.query(FacilityUser).filter(FacilityUser.facility_id == facility_id).first()
+
+        # Determine username: custom payload > existing username > clean default name
+        if payload and payload.username and payload.username.strip():
+            desired_username = payload.username.strip()
+        elif existing_user and existing_user.username:
+            desired_username = existing_user.username
+        else:
+            clean_name = "".join(c.lower() for c in facility.facility_name if c.isalnum())[:10]
+            desired_username = f"{clean_name}_admin"
+
+        desired_role = (payload and payload.role) or "FACILITY_ADMIN"
+
+        # Generate password if not provided
+        raw_password = (payload and payload.password and payload.password.strip()) or secrets.token_hex(6)
+        hashed_password = get_password_hash(raw_password)
+
+        if existing_user:
+            existing_user.username = desired_username
+            existing_user.password_hash = hashed_password
+            existing_user.role = desired_role
+            existing_user.status = "Active"
+            db.commit()
+            return AdminFacilityCredentialsIssuedResponse(
+                status="success",
+                message=f"Credentials for '{facility.facility_name}' reset successfully.",
+                facility_id=facility.id,
+                facility_name=facility.facility_name,
+                username=desired_username,
+                raw_password=raw_password,
+                role=desired_role
+            )
+
+
+        # Check username collision across facilities
+        username_clash = db.query(FacilityUser).filter(FacilityUser.username == desired_username).first()
+        if username_clash:
+            desired_username = f"{desired_username}_{facility.id}"
+
+        new_user = FacilityUser(
+            facility_id=facility.id,
+            username=desired_username,
+            password_hash=hashed_password,
+            role=desired_role,
+            status="Active"
+        )
+        db.add(new_user)
+        db.commit()
+
+        return AdminFacilityCredentialsIssuedResponse(
+            status="success",
+            message=f"Credentials issued for '{facility.facility_name}'.",
+            facility_id=facility.id,
+            facility_name=facility.facility_name,
+            username=desired_username,
+            raw_password=raw_password,
+            role=desired_role
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to issue credentials: {str(e)}"
+        )
+
+
+@router.get(
+    "/credentials",
+    response_model=list[AdminFacilityCredentialsItem],
+    summary="List all facility credential statuses"
+)
+def list_facility_credentials(
+    db: Session = Depends(get_db),
+    search: Optional[str] = None,
+) -> list[AdminFacilityCredentialsItem]:
+    """Lists every registered facility alongside its login credential status."""
+    query = db.query(Facility)
+    if search and isinstance(search, str):
+        query = query.filter(
+            or_(
+                Facility.facility_name.ilike(f"%{search.strip()}%"),
+                Facility.facility_code.ilike(f"%{search.strip()}%")
+            )
+        )
+
+    facilities = query.order_by(Facility.facility_name.asc()).all()
+
+    facility_users = {
+        fu.facility_id: fu
+        for fu in db.query(FacilityUser).all()
+    }
+
+    items = []
+    for f in facilities:
+        fu = facility_users.get(f.id)
+        items.append(
+            AdminFacilityCredentialsItem(
+                facility_id=f.id,
+                facility_code=f.facility_code or f"FAC-{f.id:06d}",
+                facility_name=f.facility_name,
+                facility_type=f.facility_type,
+                has_credentials=bool(fu and fu.status == "Active"),
+                username=fu.username if fu else None,
+                role=fu.role if fu else None,
+                status=fu.status if fu else "Not Issued",
+                created_at=fu.created_at if fu else None,
+                last_login=fu.last_login if fu else None,
+            )
+        )
+    return items
+
+
+
+# BACKWARD COMPATIBILITY /hospitals ALIAS ENDPOINTS
+
+
+@router.get("/hospitals", response_model=list[AdminFacilityItem], summary="List all hospitals (Alias for /facilities)")
+def list_all_hospitals_alias(db: Session = Depends(get_db), search: Optional[str] = Query(None)):
+    return list_all_facilities(db=db, search=search)
+
+
+@router.post("/hospitals", response_model=AdminFacilityItem, status_code=status.HTTP_201_CREATED, summary="Create hospital (Alias)")
+async def create_hospital_alias(payload: AdminHospitalCreate, db: Session = Depends(get_db)):
+    return await create_facility(
+        facility_name=payload.facility_name,
+        facility_type=payload.facility_type,
+        ownership=payload.ownership,
+        facility_head=payload.facility_head,
+        region=payload.region,
+        province=payload.province,
+        municipality=payload.municipality,
+        barangay=payload.barangay,
+        address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        contact_number=payload.contact_number,
+        email=payload.email,
+        lto_number=payload.lto_number,
+        lto_type=payload.lto_type,
+        lto_issue_date=payload.lto_issue_date,
+        lto_expiration_date=payload.lto_expiration_date,
+        lto_status=payload.lto_status,
+        facility_status=payload.facility_status,
+        pso_daily_routing_limit=payload.pso_daily_routing_limit,
+        lto_file=None,
+        db=db
+    )
+
+
+@router.patch("/hospitals/{hospital_id}", response_model=AdminFacilityItem, summary="Update hospital (Alias)")
+async def update_hospital_alias(hospital_id: int, payload: AdminFacilityUpdate, db: Session = Depends(get_db)):
+    return await update_facility(facility_id=hospital_id, payload=payload, db=db)
+
+
+@router.delete("/hospitals/{hospital_id}", response_model=ActionResponse, summary="Delete hospital (Alias)")
+def delete_hospital_alias(hospital_id: int, db: Session = Depends(get_db)):
+    return delete_facility(facility_id=hospital_id, db=db)
 
 
 # API KEY MANAGEMENT
@@ -526,46 +841,43 @@ def create_api_key(payload: AdminApiKeyCreate, db: Session = Depends(get_db)) ->
     try:
         hospital_name = payload.hospital_name.strip()
 
-        hospital = db.query(HospitalResources).filter(
-            HospitalResources.hospital_name.ilike(hospital_name)
+        hospital = db.query(Facility).filter(
+            Facility.facility_name.ilike(hospital_name)
         ).first()
         if not hospital:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No hospital named '{hospital_name}' is registered. Add it under Hospitals first."
+                detail=f"No facility named '{hospital_name}' is registered. Add it under Facilities first."
             )
 
         existing = db.query(APIKey).filter(
-            APIKey.hospital_name.ilike(hospital.hospital_name),
+            APIKey.hospital_name.ilike(hospital.facility_name),
             APIKey.is_active == True
         ).first()
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"'{hospital.hospital_name}' already holds an active key (ID {existing.id}). "
+                    f"'{hospital.facility_name}' already holds an active key (ID {existing.id}). "
                     "Rotate that key instead of minting a duplicate."
                 )
             )
 
-        # Use the hospital's canonical stored name/casing, not whatever the caller typed,
-        # so this row always matches HospitalResources.hospital_name exactly.
-        raw_key, hashed_key, display_key = generate_irdss_api_key(hospital.hospital_name)
-        record = APIKey(
-            hospital_name=hospital.hospital_name,
+        raw_key, hashed_key, masked_display = generate_irdss_api_key(hospital.facility_name)
+        api_key_rec = APIKey(
+            hospital_name=hospital.facility_name,
             api_key=hashed_key,
-            api_key_display=display_key,
-            is_active=True
+            api_key_display=masked_display,
+            is_active=True,
         )
-
-        db.add(record)
+        db.add(api_key_rec)
         db.commit()
-        db.refresh(record)
+        db.refresh(api_key_rec)
 
         return AdminApiKeyIssuedResponse(
-            message=f"API key issued for '{hospital.hospital_name}'. Copy it now — it cannot be shown again.",
+            message=f"API Key successfully minted for '{hospital.facility_name}'. Copy it now; it will not be shown again.",
             raw_key=raw_key,
-            key=_serialize_api_key(record),
+            key=_serialize_api_key(api_key_rec),
         )
 
     except HTTPException:
@@ -575,71 +887,39 @@ def create_api_key(payload: AdminApiKeyCreate, db: Session = Depends(get_db)) ->
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to issue API key: {str(e)}"
+            detail=f"Failed to mint API key: {str(e)}"
         )
 
 
-@router.post(
-    "/api-keys/{key_id}/rotate",
-    response_model=AdminApiKeyIssuedResponse,
-    summary="Rotate an existing API key"
-)
-def rotate_api_key(key_id: int, db: Session = Depends(get_db)) -> AdminApiKeyIssuedResponse:
-    """Replaces a credential's secret in place, immediately invalidating the previous key."""
+@router.patch("/api-keys/{key_id}", response_model=AdminApiKeyItem, summary="Toggle or reassign an API key")
+def update_api_key(
+    key_id: int,
+    payload: AdminApiKeyUpdate,
+    db: Session = Depends(get_db)
+) -> AdminApiKeyItem:
+    """Toggles active/revoked status or updates the owning hospital name on an existing key."""
     try:
         record = db.query(APIKey).filter(APIKey.id == key_id).first()
         if not record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"API key with ID {key_id} not found."
+                detail=f"API key record with ID {key_id} not found."
             )
 
-        raw_key, hashed_key, display_key = generate_irdss_api_key(record.hospital_name)
-        record.api_key = hashed_key
-        record.api_key_display = display_key
-        record.is_active = True
+        if payload.hospital_name:
+            new_name = payload.hospital_name.strip()
+            hospital = db.query(Facility).filter(
+                Facility.facility_name.ilike(new_name)
+            ).first()
+            if not hospital:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No facility named '{new_name}' exists."
+                )
+            record.hospital_name = hospital.facility_name
 
-        db.commit()
-        db.refresh(record)
-
-        return AdminApiKeyIssuedResponse(
-            message=(
-                f"Key rotated for '{record.hospital_name}'. The previous key is now invalid — "
-                "update that hospital's HIS configuration."
-            ),
-            raw_key=raw_key,
-            key=_serialize_api_key(record),
-        )
-
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to rotate API key: {str(e)}"
-        )
-
-
-@router.patch("/api-keys/{key_id}", response_model=AdminApiKeyItem, summary="Activate/deactivate or reassign a key")
-def update_api_key(key_id: int, payload: AdminApiKeyUpdate, db: Session = Depends(get_db)) -> AdminApiKeyItem:
-    """Toggles a credential's active flag or reassigns its owning hospital without changing the secret."""
-    try:
-        record = db.query(APIKey).filter(APIKey.id == key_id).first()
-        if not record:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"API key with ID {key_id} not found."
-            )
-
-        update_data = payload.model_dump(exclude_unset=True)
-
-        if "is_active" in update_data and update_data["is_active"] is not None:
-            record.is_active = update_data["is_active"]
-
-        if update_data.get("hospital_name"):
-            record.hospital_name = update_data["hospital_name"].strip()
+        if payload.is_active is not None:
+            record.is_active = bool(payload.is_active)
 
         db.commit()
         db.refresh(record)
@@ -656,21 +936,62 @@ def update_api_key(key_id: int, payload: AdminApiKeyUpdate, db: Session = Depend
         )
 
 
-@router.delete("/api-keys/{key_id}", response_model=ActionResponse, summary="Permanently revoke an API key")
+@router.post("/api-keys/{key_id}/rotate", response_model=AdminApiKeyIssuedResponse, summary="Rotate an API key")
+def rotate_api_key(key_id: int, db: Session = Depends(get_db)) -> AdminApiKeyIssuedResponse:
+    """Revokes the target key and mints a brand-new secret key for the same hospital in one operation."""
+    try:
+        old_record = db.query(APIKey).filter(APIKey.id == key_id).first()
+        if not old_record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"API key record with ID {key_id} not found."
+            )
+
+        old_record.is_active = False
+
+        raw_key, hashed_key, masked_display = generate_irdss_api_key(old_record.hospital_name)
+        new_record = APIKey(
+            hospital_name=old_record.hospital_name,
+            api_key=hashed_key,
+            api_key_display=masked_display,
+            is_active=True,
+        )
+        db.add(new_record)
+        db.commit()
+        db.refresh(new_record)
+
+        return AdminApiKeyIssuedResponse(
+            message=f"API key for '{old_record.hospital_name}' was rotated. Copy the new key now.",
+            raw_key=raw_key,
+            key=_serialize_api_key(new_record),
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to rotate API key: {str(e)}"
+        )
+
+
+@router.delete("/api-keys/{key_id}", response_model=ActionResponse, summary="Revoke an API key")
 def delete_api_key(key_id: int, db: Session = Depends(get_db)) -> ActionResponse:
-    """Permanently deletes a credential row, hard-revoking the hospital node's gateway access."""
+    """Deletes an API key record permanently."""
     try:
         record = db.query(APIKey).filter(APIKey.id == key_id).first()
         if not record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"API key with ID {key_id} not found."
+                detail=f"API key record with ID {key_id} not found."
             )
 
-        owner = record.hospital_name
+        hname = record.hospital_name
         db.delete(record)
         db.commit()
-        return ActionResponse(message=f"API key for '{owner}' was permanently revoked.")
+        return ActionResponse(message=f"API key for '{hname}' was revoked.")
 
     except HTTPException:
         db.rollback()
@@ -686,15 +1007,15 @@ def delete_api_key(key_id: int, db: Session = Depends(get_db)) -> ActionResponse
 # SERVER MONITORING & LOGS
 
 
-@router.get("/system/health", response_model=SystemHealthResponse, summary="Live gateway health snapshot")
+@router.get("/system/health", response_model=SystemHealthResponse, summary="Gateway process and DB health check")
 def get_system_health(
-    db: Session = Depends(get_db),
     window_minutes: int = Query(60, ge=1, le=1440),
+    db: Session = Depends(get_db),
 ) -> SystemHealthResponse:
-    """Probes the PostgreSQL connection and folds in buffered traffic metrics and table row counts."""
+    """Probes DB latency and summarizes traffic metrics over the requested window."""
     db_connected = True
-    db_error: Optional[str] = None
-    db_latency_ms: Optional[float] = None
+    db_error = None
+    db_latency_ms = None
 
     started = time.perf_counter()
     try:
@@ -712,7 +1033,8 @@ def get_system_health(
                 "referrals": db.query(func.count(Referral.referral_id)).scalar() or 0,
                 "referral_responses": db.query(func.count(ReferralResponse.id)).scalar() or 0,
                 "patient_record": db.query(func.count(PatientRecords.id)).scalar() or 0,
-                "hospital_resources": db.query(func.count(HospitalResources.id)).scalar() or 0,
+                "facilities": db.query(func.count(Facility.id)).scalar() or 0,
+                "facility_users": db.query(func.count(FacilityUser.id)).scalar() or 0,
                 "api_keys": db.query(func.count(APIKey.id)).scalar() or 0,
             }
         except Exception as e:

@@ -116,12 +116,16 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     clinical variables on-the-fly for the receiving doctor's modal [cite: 199].
     """
     # Dynamic fields resolved relational-style (never stored in responses table!)
+    created_at: Optional[datetime] = None
     referring_facility: str
     disease_severity: str
     patient_id: str
     patient_age: int
+    patient_age_months: Optional[int] = None
     patient_gender: str
     clinical_reason: Optional[str] = "None"
+    diagnosis: Optional[str] = None
+    chief_complaint: Optional[str] = None
     patient_latitude: Optional[float] = None
     patient_longitude: Optional[float] = None
     hospital_latitude: Optional[float] = None

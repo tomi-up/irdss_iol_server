@@ -72,6 +72,42 @@ async function request(path, { method = 'GET', body, params, key } = {}) {
   return payload
 }
 
+async function requestMultipart(path, formData, { method = 'POST', key } = {}) {
+  const apiKey = key ?? getStoredKey()
+  const url = new URL(`${BASE_URL}${path}`, window.location.origin)
+
+  let response
+  try {
+    response = await fetch(url.toString().replace(window.location.origin, ''), {
+      method,
+      headers: {
+        'X-API-Key': apiKey,
+      },
+      body: formData,
+    })
+  } catch {
+    throw new Error("Can't reach the IRDSS gateway. Is the FastAPI server running on port 8081?")
+  }
+
+  const text = await response.text()
+  let payload = null
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = null
+    }
+  }
+
+  if (!response.ok) {
+    const error = new Error(extractDetail(payload, `Request failed (HTTP ${response.status}).`))
+    error.status = response.status
+    throw error
+  }
+
+  return payload
+}
+
 export const adminApi = {
   // Phase 1: raw key probe — tells the login screen whether to show root bypass,
   // TOTP enrollment (QR), or a plain code prompt.
@@ -87,10 +123,19 @@ export const adminApi = {
   cancelReferral: (referralId) =>
     request(`/referrals/${encodeURIComponent(referralId)}/cancel`, { method: 'PATCH' }),
 
-  listHospitals: (params) => request('/hospitals', { params }),
-  createHospital: (body) => request('/hospitals', { method: 'POST', body }),
-  updateHospital: (id, body) => request(`/hospitals/${id}`, { method: 'PATCH', body }),
-  deleteHospital: (id) => request(`/hospitals/${id}`, { method: 'DELETE' }),
+  listFacilities: (params) => request('/facilities', { params }),
+  createFacility: (formData) => requestMultipart('/facilities', formData, { method: 'POST' }),
+  updateFacility: (id, body) => request(`/facilities/${id}`, { method: 'PATCH', body }),
+  deleteFacility: (id) => request(`/facilities/${id}`, { method: 'DELETE' }),
+  listCredentials: (params) => request('/credentials', { params }),
+  issueFacilityCredentials: (facilityId, body) => request(`/facilities/${facilityId}/credentials`, { method: 'POST', body }),
+
+
+  // Backward-compatibility aliases
+  listHospitals: (params) => request('/facilities', { params }),
+  createHospital: (formData) => requestMultipart('/facilities', formData, { method: 'POST' }),
+  updateHospital: (id, body) => request(`/facilities/${id}`, { method: 'PATCH', body }),
+  deleteHospital: (id) => request(`/facilities/${id}`, { method: 'DELETE' }),
 
   listApiKeys: (params) => request('/api-keys', { params }),
   createApiKey: (body) => request('/api-keys', { method: 'POST', body }),

@@ -34,6 +34,36 @@ class Referral(Base):
     status: Mapped[str] = mapped_column(String, default="CREATED", nullable=False)
     clinical_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    # Clinical context captured from the referring facility's FHIR payload, used to
+    # derive `required_capability` — never fed back into the FCM distance score itself,
+    # only used as a hard pre-filter alongside severity in routing_filter.py
+    diagnosis: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    chief_complaint: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Comma-separated FacilityCapability column names (e.g. "has_obgyn,has_delivery_room")
+    # that a candidate facility must have to be broadcast this referral
+    required_capability: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # AES-encrypted patient identity fields (see app.utils.security.aes_encrypt/aes_decrypt).
+    # Deliberately stored here on Referral, never on PatientRecords -- PatientRecords feeds
+    # the FCM matching engine and must stay non-identifying. These are only ever decrypted by
+    # GET /api/v1/referral/{id}/patient-details, gated on receiving_facility == caller.
+    patient_full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    patient_dob: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    patient_phone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    patient_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    patient_civil_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    patient_philhealth_number: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    patient_philhealth_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Vitals recorded by the referring doctor/nurse at the time of referral -- sent as FHIR
+    # extensions in the initiate payload but previously silently dropped (only chiefComplaint
+    # was ever parsed). Kept as strings to mirror mock_hospitals' initiated_referrals shape.
+    vital_bp: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    vital_hr: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    vital_rr: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    vital_temp_c: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    vital_o2sat: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
     # Performance auditing timestamps to calculate LGU response times [5]
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

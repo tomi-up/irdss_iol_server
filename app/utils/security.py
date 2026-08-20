@@ -29,18 +29,65 @@ if not settings.SECRET_ENCRYPTION_KEY:
     raise ValueError("ERROR: SECRET_ENCRYPTION_KEY is missing from the .env file")
 cipher_suite = Fernet(settings.SECRET_ENCRYPTION_KEY.encode('utf-8'))
 
+import bcrypt
+
 # AUTHENTICATION & TOTP
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    if not plain_password or not hashed_password:
+        return False
+    # PHP password_hash generates $2y$, Python bcrypt accepts $2b$/$2a$/$2y$
+    normalized_hash = hashed_password.replace("$2y$", "$2b$").encode('utf-8')
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), normalized_hash)
+    except Exception:
+        return False
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+FACILITY_SESSION_SCOPE = "facility_session"
+
+FACILITY_SESSION_EXPIRE_HOURS = 12
+
+def create_facility_session_token(
+    facility_id: int,
+    facility_code: str,
+    facility_name: str,
+    username: str,
+    role: str = "FACILITY_ADMIN"
+) -> str:
+    """Issues a signed session token for facility user login."""
+    return create_access_token(
+        {
+            "sub": username,
+            "facility_id": facility_id,
+            "facility_code": facility_code,
+            "facility_name": facility_name,
+            "role": role,
+            "scope": FACILITY_SESSION_SCOPE,
+        },
+        expires_delta=timedelta(hours=FACILITY_SESSION_EXPIRE_HOURS)
+    )
+
+def verify_facility_session_token(token: str) -> dict:
+    """Decodes and validates a facility session token."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("scope") == FACILITY_SESSION_SCOPE and payload.get("sub"):
+            return payload
+    except JWTError:
+        pass
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired facility session token."
+    )
 
 def generate_totp_secret() -> str:
     return pyotp.random_base32()

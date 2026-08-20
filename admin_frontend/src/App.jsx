@@ -7,7 +7,7 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Referrals from './pages/Referrals'
 import Hospitals from './pages/Hospitals'
-import ApiKeys from './pages/ApiKeys'
+import Credentials from './pages/Credentials'
 import Monitoring from './pages/Monitoring'
 
 // Renders the console only once a stored admin key has been revalidated against the gateway.
@@ -30,13 +30,15 @@ function AuthGate() {
         <Route index element={<Dashboard />} />
         <Route path="referrals" element={<Referrals />} />
         <Route path="hospitals" element={<Hospitals />} />
-        <Route path="api-keys" element={<ApiKeys />} />
+        <Route path="credentials" element={<Credentials />} />
+        <Route path="api-keys" element={<Navigate to="/credentials" replace />} />
         <Route path="monitoring" element={<Monitoring />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
   )
 }
+
 
 export default function App() {
   return (

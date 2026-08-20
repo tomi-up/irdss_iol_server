@@ -177,11 +177,12 @@ export default function Dashboard() {
               hint="Network-wide capacity"
             />
             <StatCard
-              label="Active API Keys"
-              value={stats.active_api_keys}
+              label="Issued Credentials"
+              value={stats.issued_credentials ?? stats.active_api_keys ?? 0}
               tone="blue"
-              hint={`${stats.total_api_keys} issued in total`}
+              hint={`${stats.total_hospitals ?? 0} facilities registered`}
             />
+
             <StatCard
               label="Avg. First Response"
               value={stats.avg_response_minutes !== null ? `${stats.avg_response_minutes}m` : '—'}

@@ -3,10 +3,11 @@ Pydantic contracts for the IRDSS Admin Panel (/api/v1/admin). Every admin endpoi
 validates in and out through these models — no raw dictionaries cross the wire.
 """
 
-from datetime import datetime
-from typing import Any, List, Optional
+from datetime import date, datetime
+from typing import Any, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
+
 
 
 # GENERIC
@@ -132,8 +133,10 @@ class AdminStatsResponse(BaseModel):
     cancelled_referrals: int
     total_hospitals: int
     total_available_beds: int
-    total_api_keys: int
-    active_api_keys: int
+    total_credentials: int = 0
+    issued_credentials: int = 0
+    total_api_keys: int = 0
+    active_api_keys: int = 0
     avg_response_minutes: Optional[float] = None
     status_breakdown: List[StatusCountItem]
     severity_breakdown: List[StatusCountItem]
@@ -142,58 +145,146 @@ class AdminStatsResponse(BaseModel):
     daily_volume: List[DailyVolumeItem]
 
 
-# HOSPITAL MANAGEMENT
+
+# FACILITY MANAGEMENT
 
 
-class AdminHospitalItem(BaseModel):
-    """Full hospital resource record as surfaced in the admin hospital manager."""
+class AdminFacilityItem(BaseModel):
+    """Full facility record as surfaced in the admin facility manager."""
     id: int
-    hospital_name: str
-    hospital_level: Optional[str] = None
-    hospital_environment: Optional[str] = None
+    facility_code: Optional[str] = None
+    facility_name: str
+    facility_type: Optional[str] = None
+    ownership: Optional[str] = None
+    facility_head: Optional[str] = None
+    region: Optional[str] = None
+    province: Optional[str] = None
+    municipality: Optional[str] = None
+    barangay: Optional[str] = None
+    address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    available_beds: Optional[int] = None
-    emergency_equipment: Optional[bool] = None
-    medical_equipment: Optional[bool] = None
-    communication_systems: Optional[bool] = None
-    medical_specialists_count: Optional[int] = None
+    contact_number: Optional[str] = None
+    email: Optional[str] = None
+    lto_number: Optional[str] = None
+    lto_type: Optional[str] = None
+    lto_issue_date: Optional[Union[date, str]] = None
+    lto_expiration_date: Optional[Union[date, str]] = None
+    lto_status: Optional[str] = None
+    lto_file_path: Optional[str] = None
+    facility_status: Optional[str] = "Active"
     pso_daily_routing_limit: Optional[int] = None
     referrals_accepted_today: Optional[int] = None
     has_api_key: bool = False
+    has_facility_user: bool = False
+    facility_username: Optional[str] = None
+
+    # Backward compatibility aliases
+    @property
+    def hospital_name(self) -> str:
+        return self.facility_name
+
+    @property
+    def hospital_level(self) -> Optional[str]:
+        return self.facility_type
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class AdminHospitalCreate(BaseModel):
-    """Payload for provisioning a brand new hospital node from the admin panel."""
-    hospital_name: str = Field(..., min_length=2)
-    hospital_level: str = "Level 1"
-    hospital_environment: str = "Urban"
-    latitude: float = 0.0
-    longitude: float = 0.0
-    available_beds: int = 0
-    emergency_equipment: bool = False
-    medical_equipment: bool = False
-    communication_systems: bool = False
-    medical_specialists_count: int = 0
+class AdminFacilityCreate(BaseModel):
+    """Payload for provisioning a brand new facility node from the admin panel."""
+    facility_name: str = Field(..., min_length=2)
+    facility_type: str = "Level 1 Hospital"
+    ownership: str = "Government"
+    facility_head: Optional[str] = None
+    region: Optional[str] = None
+    province: Optional[str] = None
+    municipality: Optional[str] = None
+    barangay: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = 0.0
+    longitude: Optional[float] = 0.0
+    contact_number: Optional[str] = None
+    email: Optional[str] = None
+    lto_number: Optional[str] = None
+    lto_type: Optional[str] = None
+    lto_issue_date: Optional[Union[date, str]] = None
+    lto_expiration_date: Optional[Union[date, str]] = None
+    lto_status: Optional[str] = "Active"
+    facility_status: str = "Active"
     pso_daily_routing_limit: int = 5
 
 
-class AdminHospitalUpdate(BaseModel):
-    """Partial update payload; only the fields present are written."""
-    hospital_name: Optional[str] = Field(None, min_length=2)
-    hospital_level: Optional[str] = None
-    hospital_environment: Optional[str] = None
+class AdminFacilityUpdate(BaseModel):
+    """Partial update payload for facility records."""
+    facility_name: Optional[str] = Field(None, min_length=2)
+    facility_type: Optional[str] = None
+    ownership: Optional[str] = None
+    facility_head: Optional[str] = None
+    region: Optional[str] = None
+    province: Optional[str] = None
+    municipality: Optional[str] = None
+    barangay: Optional[str] = None
+    address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    available_beds: Optional[int] = None
-    emergency_equipment: Optional[bool] = None
-    medical_equipment: Optional[bool] = None
-    communication_systems: Optional[bool] = None
-    medical_specialists_count: Optional[int] = None
+    contact_number: Optional[str] = None
+    email: Optional[str] = None
+    lto_number: Optional[str] = None
+    lto_type: Optional[str] = None
+    lto_issue_date: Optional[Union[date, str]] = None
+    lto_expiration_date: Optional[Union[date, str]] = None
+    lto_status: Optional[str] = None
+    lto_file_path: Optional[str] = None
+    facility_status: Optional[str] = None
     pso_daily_routing_limit: Optional[int] = None
     referrals_accepted_today: Optional[int] = None
+
+
+
+class AdminFacilityCredentialsCreate(BaseModel):
+    """Request payload for issuing login credentials to a facility admin."""
+    username: Optional[str] = None
+    password: Optional[str] = None
+    role: str = "FACILITY_ADMIN"
+
+
+class AdminFacilityCredentialsIssuedResponse(BaseModel):
+    """
+    Returned exactly once when credentials are issued/reset.
+    raw_password is returned only in this response and never stored plaintext.
+    """
+    status: str = "success"
+    message: str
+    facility_id: int
+    facility_name: str
+    username: str
+    raw_password: str
+    role: str
+
+
+class AdminFacilityCredentialsItem(BaseModel):
+    """Full facility credential representation for the Credentials management dashboard."""
+    facility_id: int
+    facility_code: Optional[str] = None
+    facility_name: str
+    facility_type: Optional[str] = None
+    has_credentials: bool = False
+    username: Optional[str] = None
+    role: Optional[str] = None
+    status: Optional[str] = None
+    created_at: Optional[datetime] = None
+    last_login: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+
+# Backward-compatibility aliases
+AdminHospitalItem = AdminFacilityItem
+AdminHospitalCreate = AdminFacilityCreate
+AdminHospitalUpdate = AdminFacilityUpdate
+
 
 
 # API KEY MANAGEMENT

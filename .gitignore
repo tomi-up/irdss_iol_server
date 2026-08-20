@@ -1,2 +1,5 @@
 .env
 .idea/
+storage/lto_files/
+__pycache__/
+*.pyc
