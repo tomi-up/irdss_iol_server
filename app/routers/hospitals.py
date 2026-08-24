@@ -1,5 +1,6 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database.db_connection import get_db
@@ -12,11 +13,62 @@ from app.schemas.hospital_schema import (
     HospitalDetailSchema
 )
 from app.utils.security import verify_api_key
+from app.utils.three_layer_auth import enforce_three_layer_auth, ThreeLayerAuthContext
 
 router = APIRouter(
     prefix="/api/v1/hospitals",
     tags=["Facility Management"]
 )
+
+
+class FacilityCapabilitySyncPayload(BaseModel):
+    """Mirrors mock_hospitals' local `service_assessments` table field-for-field, so
+    the local Service Assessment form can be pushed here without any translation."""
+    authorized_bed_capacity: int = 0
+    functional_beds: int = 0
+    has_icu: bool = False
+    has_nicu: bool = False
+    has_er_trauma: bool = False
+    has_delivery_room: bool = False
+    has_hemodialysis: bool = False
+    has_blood_bank: bool = False
+    has_ct_mri: bool = False
+    has_cardiologist: bool = False
+    has_obgyn: bool = False
+    has_neurologist: bool = False
+    has_general_surgeon: bool = False
+
+
+@router.put("/capability", summary="Upsert this facility's bed/capability profile from its local Service Assessment")
+async def upsert_facility_capability(
+    payload: FacilityCapabilitySyncPayload,
+    db: Session = Depends(get_db),
+    auth_ctx: ThreeLayerAuthContext = Depends(enforce_three_layer_auth)
+):
+    """
+    Keeps PostgreSQL's FacilityCapability row (read by the AI referral-matching engine
+    and the admin dashboard's bed-count stat) in sync with whatever a facility admin
+    submits on mock_hospitals' local Service Assessment form -- previously that data
+    never left MySQL, so a facility's real bed counts/capabilities had zero effect on
+    its ranking in referral recommendations.
+    """
+    facility = auth_ctx.facility
+
+    cap = db.query(FacilityCapability).filter(FacilityCapability.facility_id == facility.id).first()
+    if not cap:
+        cap = FacilityCapability(facility_id=facility.id)
+        db.add(cap)
+
+    for field_name in FacilityCapabilitySyncPayload.model_fields:
+        setattr(cap, field_name, getattr(payload, field_name))
+
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Facility capability profile synced for '{facility.facility_name}'.",
+        "facility_id": facility.id
+    }
 
 
 def extract_fhir_location_fields(payload: FHIRHospitalLocationRequest) -> dict:

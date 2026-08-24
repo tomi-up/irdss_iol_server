@@ -229,7 +229,7 @@ def submit_doh_assessment(
 
         return FacilityAssessmentSubmitResponse(
             status="success",
-            message=f"DOH Service Assessment for '{facility.facility_name}' saved to central PostgreSQL.",
+            message=f"DOH Service Assessment for '{facility.facility_name}' saved successfully.",
             assessment_id=assessment.id,
             submitted_at=assessment.submitted_at
         )

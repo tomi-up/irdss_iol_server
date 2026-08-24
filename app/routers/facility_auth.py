@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -22,6 +23,7 @@ class FacilityLoginResponse(BaseModel):
     facility_id: int
     facility_code: str
     facility_name: str
+    facility_type: Optional[str] = None
     role: str
 
 
@@ -73,5 +75,6 @@ def facility_login(payload: FacilityLoginRequest, db: Session = Depends(get_db))
         facility_id=facility.id,
         facility_code=facility.facility_code or f"FAC-{facility.id:06d}",
         facility_name=facility.facility_name,
+        facility_type=facility.facility_type,
         role=user.role
     )

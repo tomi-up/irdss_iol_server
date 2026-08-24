@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import List, Optional
 from app.schemas.patient_schema import FHIRPatient
 from datetime import datetime
@@ -153,3 +153,37 @@ class FinalizeReferralSchema(BaseModel):
     the patient's clinical pathway among the hospitals that accepted the referral.
     """
     hospital_name: str
+
+
+class ArriveReferralSchema(BaseModel):
+    """
+    Optional vitals the receiving facility captures at the moment the patient
+    physically arrives -- distinct from the referring facility's vital_* readings
+    taken at referral time, since a patient's condition can change in transport.
+    All fields optional: marking arrival must never be blocked on filling this in.
+    """
+    vital_bp: Optional[str] = None
+    vital_hr: Optional[str] = None
+    vital_rr: Optional[str] = None
+    vital_temp_c: Optional[str] = None
+    vital_o2sat: Optional[str] = None
+
+
+DEPARTURE_OUTCOMES = ("DISCHARGED", "TRANSFERRED", "DECEASED", "LEFT_AMA")
+
+
+class DepartReferralSchema(BaseModel):
+    """
+    Marks the end of the receiving facility's episode of care for this patient, so
+    the original referring hospital's tracker doesn't go dark after "Arrived".
+    """
+    outcome: str
+    remarks: Optional[str] = None
+
+    @field_validator("outcome")
+    @classmethod
+    def validate_outcome(cls, v: str) -> str:
+        upper = v.strip().upper()
+        if upper not in DEPARTURE_OUTCOMES:
+            raise ValueError(f"outcome must be one of {DEPARTURE_OUTCOMES}")
+        return upper

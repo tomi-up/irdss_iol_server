@@ -1,4 +1,5 @@
 import hashlib
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
@@ -10,7 +11,7 @@ from app.models.facility_capability import FacilityCapability
 from app.models.referral_model import Referral
 from app.models.referral_response_model import ReferralResponse
 # Import your schemas, database connections, and SQLAlchemy models
-from app.schemas.encounter import ReferralRequestSchema, ReferralResponseSchema, IncomingReferralSchema,  ResponsePayloadSchema, IncomingReferralDetailsSchema, FinalizeReferralSchema
+from app.schemas.encounter import ReferralRequestSchema, ReferralResponseSchema, IncomingReferralSchema,  ResponsePayloadSchema, IncomingReferralDetailsSchema, FinalizeReferralSchema, ArriveReferralSchema, DepartReferralSchema
 from app.models.patient_model import PatientRecords
 from app.models.referral_model import Referral
 from app.models.api_key import APIKey
@@ -19,6 +20,7 @@ from app.database.db_connection import get_db
 from app.ai.routing_filter import get_qualified_broadcast_targets
 from app.ai.fcm_matching import compute_compatibility_scores
 from app.utils.diagnosis_capability import derive_required_capabilities
+from app.utils.ws_manager import manager
 
 router = APIRouter()
 
@@ -84,6 +86,20 @@ async def get_current_hospital(
     request.state.hospital_name = record.hospital_name
     return record.hospital_name
 
+
+
+@router.post("/api/v1/ws-ticket")
+async def issue_ws_ticket(
+    current_hospital_name: str = Depends(get_current_hospital)
+):
+    """
+    Issues a short-lived (60s), one-time ticket that authorizes a real-time
+    WebSocket connection for this facility at /ws/referrals. Required because
+    browser WebSocket clients cannot attach the RSA signature headers used by
+    every other endpoint directly onto the connection handshake.
+    """
+    token = manager.issue_ticket(current_hospital_name, ttl_seconds=60)
+    return {"ticket": token, "expires_in": 60}
 
 
 @router.get("/api/v1/referral/incoming", response_model=list[IncomingReferralDetailsSchema])
@@ -160,7 +176,7 @@ def get_incoming_referrals(
     return formatted_responses
 
 @router.patch("/api/v1/referral/{referral_id}/seen")
-def mark_referral_seen(
+async def mark_referral_seen(
         referral_id: str,
         db: Session = Depends(get_db),
         hospital_name: str = Depends(get_current_hospital)
@@ -194,6 +210,14 @@ def mark_referral_seen(
             referral.status = "SEEN"
 
     db.commit()
+
+    if referral:
+        await manager.broadcast_to_facility(referral.referring_facility, {
+            "type": "REFERRAL_SEEN",
+            "referral_id": referral_id,
+            "seen_by": hospital_name,
+            "seen_at": alert.seen_at.isoformat() if alert.seen_at else None,
+        })
 
     return {
         "status": "success",
@@ -240,6 +264,15 @@ async def respond_to_referral(
             alert.seen_at = datetime.now(timezone.utc)
 
         db.commit()
+
+        referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+        if referral:
+            await manager.broadcast_to_facility(referral.referring_facility, {
+                "type": "REFERRAL_ACCEPTED" if payload.decision == "ACCEPTED" else "REFERRAL_REDIRECTED",
+                "referral_id": referral_id,
+                "hospital_name": hospital_name,
+                "responded_at": alert.responded_at.isoformat() if alert.responded_at else None,
+            })
 
         return {
             "status": "success",
@@ -482,6 +515,17 @@ async def initiate_referral(
         db.commit()
         broadcast_list = [h.facility_name for h in qualified_hospitals]
 
+        for hospital_name in broadcast_list:
+            if hospital_name.strip().lower() == referring_hospital.strip().lower():
+                continue
+            await manager.broadcast_to_facility(hospital_name, {
+                "type": "NEW_REFERRAL",
+                "referral_id": new_referral.referral_id,
+                "referring_facility": referring_hospital,
+                "disease_severity": patient_severity,
+                "created_at": new_referral.created_at.isoformat() if new_referral.created_at else None,
+            })
+
         return ReferralResponseSchema(
             status="success",
             message="Referral securely verified, split, and logged in the central IoL queue.",
@@ -608,6 +652,42 @@ def get_my_referrals(
     for resp in all_responses:
         responses_by_referral.setdefault(resp.referral_id, []).append(resp)
 
+    # Detect if a patient who arrived at their receiving facility was later referred
+    # onward again from there -- lets the ORIGINAL referring hospital see the patient's
+    # journey continue past their own tracker instead of going dark after "Arrived".
+    # Matched via patient_code, the same anonymized SHA-256 identity hash already used
+    # to block a second concurrent active referral for the same patient network-wide.
+    onward_by_source_referral: dict[str, dict] = {}
+    own_referral_ids = {r.referral_id for r in referrals}
+    arrived_patient_codes = [r.patient_code for r in referrals if r.arrived_at and r.patient_code]
+    if arrived_patient_codes:
+        candidate_onward = db.query(Referral).filter(
+            Referral.patient_code.in_(arrived_patient_codes),
+            Referral.referral_id.notin_(own_referral_ids)
+        ).order_by(Referral.created_at.asc()).all()
+
+        for ref in referrals:
+            if not ref.arrived_at or not ref.patient_code:
+                continue
+            match = next(
+                (c for c in candidate_onward
+                 if c.patient_code == ref.patient_code
+                 and ref.receiving_facility
+                 and c.referring_facility.strip().lower() == ref.receiving_facility.strip().lower()
+                 and c.created_at and c.created_at >= ref.arrived_at),
+                None
+            )
+            if match:
+                match_responses = db.query(ReferralResponse).filter(
+                    ReferralResponse.referral_id == match.referral_id
+                ).all()
+                onward_by_source_referral[ref.referral_id] = {
+                    "referral_id": match.referral_id,
+                    "status": _compute_referral_status(match, match_responses),
+                    "receiving_facility": match.receiving_facility,
+                    "created_at": match.created_at,
+                }
+
     results = []
     for ref in referrals:
         ref_responses = responses_by_referral.get(ref.referral_id, [])
@@ -643,6 +723,10 @@ def get_my_referrals(
             "accepted_at": accepted_at,
             "finalized_at": ref.evaluated_at,
             "arrived_at": ref.arrived_at,
+            "departed_at": ref.departed_at,
+            "departure_outcome": ref.departure_outcome,
+            "departure_remarks": ref.departure_remarks,
+            "onward_referral": onward_by_source_referral.get(ref.referral_id),
             "responses": [
                 {
                     "hospital_name": r.hospital_name,
@@ -658,7 +742,7 @@ def get_my_referrals(
 
 
 @router.patch("/api/v1/referral/{referral_id}/cancel")
-def cancel_referral(
+async def cancel_referral(
     referral_id: str,
     db: Session = Depends(get_db),
     referring_hospital: str = Depends(get_current_hospital)
@@ -698,6 +782,12 @@ def cancel_referral(
 
         db.commit()
 
+        for r in responses:
+            await manager.broadcast_to_facility(r.hospital_name, {
+                "type": "REFERRAL_CANCELLED",
+                "referral_id": referral_id,
+            })
+
         return {
             "status": "success",
             "message": "Referral cancelled successfully.",
@@ -713,7 +803,7 @@ def cancel_referral(
 
 
 @router.patch("/api/v1/referral/{referral_id}/finalize")
-def finalize_referral(
+async def finalize_referral(
     referral_id: str,
     payload: FinalizeReferralSchema,
     db: Session = Depends(get_db),
@@ -764,8 +854,16 @@ def finalize_referral(
         referral.status = "ACCEPTED"
         referral.evaluated_at = datetime.now(timezone.utc)
 
+        # Close out every other hospital's alert once the decision is made -- not just
+        # the ones that had ACCEPTED, but also any still-PENDING (never responded in
+        # time). Otherwise a silent hospital would keep seeing this referral as an open
+        # action item in /incoming forever, and the referring doctor's tracker would
+        # show it stuck at "Pending" indefinitely even though the case is already closed.
+        # REDIRECTED and CANCELLED are left alone -- those are real prior decisions.
         for r in responses:
-            if r.response_status == "ACCEPTED" and r.hospital_name != chosen_response.hospital_name:
+            if r.hospital_name == chosen_response.hospital_name:
+                continue
+            if r.response_status in ("ACCEPTED", "PENDING"):
                 r.response_status = "NOT_SELECTED"
 
         chosen_hospital = db.query(Facility).filter(
@@ -775,6 +873,29 @@ def finalize_referral(
             chosen_hospital.referrals_accepted_today = (chosen_hospital.referrals_accepted_today or 0) + 1
 
         db.commit()
+
+        # Real-time push: the chosen hospital gets a distinct "you won it" event, every
+        # other hospital that had accepted (now flipped to NOT_SELECTED) is told to drop
+        # this referral from its Incoming Patients view, and the referring hospital gets
+        # a confirmation echo so a second open tab/session stays in sync too.
+        await manager.broadcast_to_facility(chosen_response.hospital_name, {
+            "type": "REFERRAL_FINALIZED_TO_YOU",
+            "referral_id": referral_id,
+            "referring_facility": referring_hospital,
+        })
+
+        for r in responses:
+            if r.hospital_name != chosen_response.hospital_name and r.response_status == "NOT_SELECTED":
+                await manager.broadcast_to_facility(r.hospital_name, {
+                    "type": "REFERRAL_NOT_SELECTED",
+                    "referral_id": referral_id,
+                })
+
+        await manager.broadcast_to_facility(referring_hospital, {
+            "type": "REFERRAL_FINALIZED_CONFIRMED",
+            "referral_id": referral_id,
+            "receiving_facility": chosen_response.hospital_name,
+        })
 
         return {
             "status": "success",
@@ -844,6 +965,12 @@ def get_referral_patient_details(
         "vital_o2sat": referral.vital_o2sat,
         "vital_height_cm": referral.vital_height_cm,
         "vital_weight_kg": referral.vital_weight_kg,
+        "arrival_vital_bp": referral.arrival_vital_bp,
+        "arrival_vital_hr": referral.arrival_vital_hr,
+        "arrival_vital_rr": referral.arrival_vital_rr,
+        "arrival_vital_temp_c": referral.arrival_vital_temp_c,
+        "arrival_vital_o2sat": referral.arrival_vital_o2sat,
+        "arrived_at": referral.arrived_at,
         "is_pwd": referral.is_pwd,
         "is_pregnant": referral.is_pregnant,
         "is_senior_citizen": referral.is_senior_citizen,
@@ -902,6 +1029,9 @@ def get_referral_outcomes(
             "seen_at": resp.seen_at,
             "responded_at": resp.responded_at,
             "arrived_at": ref.arrived_at,
+            "departed_at": ref.departed_at,
+            "departure_outcome": ref.departure_outcome,
+            "departure_remarks": ref.departure_remarks,
         })
 
     outcomes.sort(key=lambda o: o["created_at"] or "", reverse=True)
@@ -909,8 +1039,9 @@ def get_referral_outcomes(
 
 
 @router.patch("/api/v1/referral/{referral_id}/arrive")
-def mark_referral_arrived(
+async def mark_referral_arrived(
     referral_id: str,
+    payload: Optional[ArriveReferralSchema] = None,
     db: Session = Depends(get_db),
     current_hospital_name: str = Depends(get_current_hospital)
 ):
@@ -921,6 +1052,11 @@ def mark_referral_arrived(
     receiving facility's local HIS uses to decide when to create its own local patient
     record for this transfer, so referrals that get finalized but never arrive don't
     clutter the local roster as if they were already under care.
+
+    Optionally accepts a fresh set of vitals taken at arrival -- kept separate from
+    the referring facility's vital_* readings since a patient's condition can change
+    meaningfully during transport. Never required: marking arrival must not be blocked
+    on filling in vitals.
     """
     referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
 
@@ -935,10 +1071,85 @@ def mark_referral_arrived(
 
     if not referral.arrived_at:
         referral.arrived_at = datetime.now(timezone.utc)
+
+        if payload:
+            if payload.vital_bp:
+                referral.arrival_vital_bp = payload.vital_bp
+            if payload.vital_hr:
+                referral.arrival_vital_hr = payload.vital_hr
+            if payload.vital_rr:
+                referral.arrival_vital_rr = payload.vital_rr
+            if payload.vital_temp_c:
+                referral.arrival_vital_temp_c = payload.vital_temp_c
+            if payload.vital_o2sat:
+                referral.arrival_vital_o2sat = payload.vital_o2sat
+
         db.commit()
+
+        await manager.broadcast_to_facility(referral.referring_facility, {
+            "type": "PATIENT_ARRIVED",
+            "referral_id": referral.referral_id,
+            "arrived_at": referral.arrived_at.isoformat(),
+        })
 
     return {
         "status": "success",
         "referral_id": referral.referral_id,
         "arrived_at": referral.arrived_at
+    }
+
+
+@router.patch("/api/v1/referral/{referral_id}/depart")
+async def mark_referral_departed(
+    referral_id: str,
+    payload: DepartReferralSchema,
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital)
+):
+    """
+    Marks the end of this facility's episode of care for the patient -- discharged,
+    transferred onward, deceased, or left against medical advice -- so the original
+    referring hospital's tracker doesn't go dark after "Arrived". Only the facility
+    the patient actually arrived at can record this, and only once.
+    """
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+
+    if not referral:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referral not found.")
+
+    if not referral.receiving_facility or referral.receiving_facility.strip().lower() != current_hospital_name.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the facility this referral was finalized to can record the patient's departure."
+        )
+
+    if not referral.arrived_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This patient hasn't been marked as arrived yet."
+        )
+
+    if referral.departed_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"This patient's departure was already recorded ({referral.departure_outcome})."
+        )
+
+    referral.departed_at = datetime.now(timezone.utc)
+    referral.departure_outcome = payload.outcome
+    referral.departure_remarks = payload.remarks
+    db.commit()
+
+    await manager.broadcast_to_facility(referral.referring_facility, {
+        "type": "PATIENT_DEPARTED",
+        "referral_id": referral.referral_id,
+        "departed_at": referral.departed_at.isoformat(),
+        "departure_outcome": referral.departure_outcome,
+    })
+
+    return {
+        "status": "success",
+        "referral_id": referral.referral_id,
+        "departed_at": referral.departed_at,
+        "departure_outcome": referral.departure_outcome
     }

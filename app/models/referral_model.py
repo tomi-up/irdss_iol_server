@@ -66,6 +66,16 @@ class Referral(Base):
     vital_height_cm: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     vital_weight_kg: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    # Vitals recorded by the receiving facility at the moment the patient physically
+    # arrives (distinct from vital_* above, which are the referring facility's readings
+    # at referral time) -- a patient's condition can change meaningfully in transport,
+    # so this captures a second, independent snapshot rather than overwriting the first.
+    arrival_vital_bp: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    arrival_vital_hr: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    arrival_vital_rr: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    arrival_vital_temp_c: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    arrival_vital_o2sat: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
     # Patient status flags entered by the referring doctor/nurse at referral time --
     # relevant to how the receiving facility triages/accepts, not just post-acceptance viewing
     is_pwd: Mapped[bool] = mapped_column(default=False, nullable=False)
@@ -86,6 +96,14 @@ class Referral(Base):
                                                              nullable=True)  # Timestamp when Accepted/Redirected button is clicked [7]
     arrived_at: Mapped[Optional[datetime]] = mapped_column(DateTime,
                                                            nullable=True)  # Timestamp when patient physically arrives at the facility [4]
+
+    # Marks the end of this facility's episode of care for the patient -- lets the
+    # ORIGINAL referring hospital see what became of them after arrival (discharged,
+    # transferred onward, deceased, left against medical advice) instead of the trail
+    # going cold once arrived_at is stamped.
+    departed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    departure_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # DISCHARGED / TRANSFERRED / DECEASED / LEFT_AMA
+    departure_remarks: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     # Bidirectional ORM relationship back to Patient
     # We reference the class name as a string to completely prevent circular imports!

@@ -113,7 +113,7 @@ async def monitor_requests(request: Request, call_next):
 from fastapi.staticfiles import StaticFiles
 import os
 
-from app.routers import admin, admin_auth, referral, hospitals, facility_auth, assessments
+from app.routers import admin, admin_auth, referral, hospitals, facility_auth, assessments, ws
 
 # Ensure storage directory exists for LTO file uploads
 os.makedirs("storage/lto_files", exist_ok=True)
@@ -126,6 +126,7 @@ app.include_router(facility_auth.router)
 app.include_router(referral.router)
 app.include_router(hospitals.router)
 app.include_router(assessments.router)
+app.include_router(ws.router)
 
 
 # Register the internal SYSTEM_ADMIN control plane consumed by admin_frontend.
