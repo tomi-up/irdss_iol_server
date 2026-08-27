@@ -122,6 +122,7 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     patient_id: str
     patient_age: int
     patient_age_months: Optional[int] = None
+    patient_age_days: Optional[int] = None
     patient_gender: str
     clinical_reason: Optional[str] = "None"
     diagnosis: Optional[str] = None

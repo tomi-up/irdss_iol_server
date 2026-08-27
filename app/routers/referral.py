@@ -2,6 +2,7 @@ import hashlib
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 
@@ -156,6 +157,7 @@ def get_incoming_referrals(
             "patient_id": readable_patient_id,  # ◄── This now securely decrypted! [cite: 87]
             "patient_age": ref.patient.age,  # Eager-loaded from PatientRecords [cite: 164]
             "patient_age_months": ref.patient.age_months,
+            "patient_age_days": ref.patient.age_days,
             "patient_gender": ref.patient.gender or "unknown",  # Read direct model column [cite: 164]
             "clinical_reason": ref.clinical_reason or "No reason provided",
             "diagnosis": ref.diagnosis,
@@ -313,6 +315,10 @@ async def initiate_referral(
             (current_date.year - birth_date.year) * 12 + (current_date.month - birth_date.month)
             - (1 if current_date.day < birth_date.day else 0)
         )
+        # Precise age in whole days -- `calculated_age_months` alone floors to 0 for any
+        # newborn under a month old, so a 1-day-old and a 29-day-old would otherwise look
+        # identical too (both show "0 months old")
+        calculated_age_days = (current_date.date() - birth_date.date()).days
         patient_gender = getattr(payload.patient_record, "gender", "unknown") or "unknown"
         clinical_reason = "No reason provided"
         diagnosis_text = None
@@ -444,6 +450,7 @@ async def initiate_referral(
         if existing_patient:
             existing_patient.age = calculated_age
             existing_patient.age_months = calculated_age_months
+            existing_patient.age_days = calculated_age_days
             existing_patient.salary = patient_salary
             existing_patient.severity = patient_severity
             existing_patient.latitude = patient_lat
@@ -454,6 +461,7 @@ async def initiate_referral(
                 fhir_id=encrypted_fhir_id,
                 age=calculated_age,
                 age_months=calculated_age_months,
+                age_days=calculated_age_days,
                 salary=patient_salary,
                 severity=patient_severity,
                 latitude=patient_lat,
@@ -953,6 +961,8 @@ def get_referral_patient_details(
         "philhealth_status": safe_decrypt(referral.patient_philhealth_status),
         "gender": referral.patient.gender if referral.patient else None,
         "age": referral.patient.age if referral.patient else None,
+        "age_months": referral.patient.age_months if referral.patient else None,
+        "age_days": referral.patient.age_days if referral.patient else None,
         "diagnosis": referral.diagnosis,
         "chief_complaint": referral.chief_complaint,
         "reason_text": referral.clinical_reason,
@@ -1036,6 +1046,77 @@ def get_referral_outcomes(
 
     outcomes.sort(key=lambda o: o["created_at"] or "", reverse=True)
     return outcomes
+
+
+@router.get("/api/v1/referral/analytics")
+def get_facility_analytics(
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital)
+):
+    """
+    Facility-admin-facing aggregates that the outcome counters on Incoming Patients
+    don't cover: what this facility refers patients out FOR (top reasons), who sends
+    patients TO this facility, who this facility sends patients TO, and monthly
+    referral volume in both directions. Outcome counters themselves (Transferred To
+    Us / Discharged / Referred Onward / etc.) are intentionally NOT duplicated here --
+    the frontend reuses /api/v1/referral/outcomes so the two views can never drift
+    apart on those numbers.
+    """
+    name = current_hospital_name.strip()
+
+    def top_n(column, filter_condition, limit=10):
+        rows = (
+            db.query(column.label("label"), func.count(Referral.referral_id).label("count"))
+            .filter(filter_condition, column.isnot(None), column != "")
+            .group_by(column)
+            .order_by(func.count(Referral.referral_id).desc())
+            .limit(limit)
+            .all()
+        )
+        return [{"label": r.label, "count": r.count} for r in rows]
+
+    top_reasons = top_n(
+        Referral.clinical_reason,
+        func.lower(Referral.referring_facility) == name.lower()
+    )
+    top_senders = top_n(
+        Referral.referring_facility,
+        func.lower(Referral.receiving_facility) == name.lower()
+    )
+    top_receivers = top_n(
+        Referral.receiving_facility,
+        func.lower(Referral.referring_facility) == name.lower()
+    )
+
+    month = func.date_trunc("month", Referral.created_at)
+    sent_rows = (
+        db.query(month.label("month"), func.count(Referral.referral_id).label("count"))
+        .filter(func.lower(Referral.referring_facility) == name.lower())
+        .group_by(month)
+        .order_by(month)
+        .all()
+    )
+    received_rows = (
+        db.query(month.label("month"), func.count(Referral.referral_id).label("count"))
+        .filter(func.lower(Referral.receiving_facility) == name.lower())
+        .group_by(month)
+        .order_by(month)
+        .all()
+    )
+    sent_by_month = {r.month.strftime("%Y-%m"): r.count for r in sent_rows}
+    received_by_month = {r.month.strftime("%Y-%m"): r.count for r in received_rows}
+    all_months = sorted(set(sent_by_month) | set(received_by_month))
+    monthly_volume = [
+        {"month": m, "sent": sent_by_month.get(m, 0), "received": received_by_month.get(m, 0)}
+        for m in all_months
+    ]
+
+    return {
+        "top_reasons": top_reasons,
+        "top_senders": top_senders,
+        "top_receivers": top_receivers,
+        "monthly_volume": monthly_volume,
+    }
 
 
 @router.patch("/api/v1/referral/{referral_id}/arrive")
