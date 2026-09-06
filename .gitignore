@@ -1,5 +1,6 @@
 .env
 .idea/
 storage/lto_files/
+storage/referral_attachments/
 __pycache__/
 *.pyc

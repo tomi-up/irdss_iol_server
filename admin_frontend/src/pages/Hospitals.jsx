@@ -490,13 +490,17 @@ function FacilityFormModal({ facility, onClose, onSaved }) {
             </div>
             <div>
               <label className={LABEL} htmlFor="lto_type">LTO License Type</label>
-              <input
+              <select
                 id="lto_type"
                 className={INPUT}
                 value={form.lto_type}
                 onChange={(e) => setField('lto_type', e.target.value)}
-                placeholder="Hospital Level 1 / RHU"
-              />
+              >
+                <option value="">Select license type…</option>
+                {FACILITY_TYPES.map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
             </div>
             <div>
               <label className={LABEL} htmlFor="lto_issue_date">Issue Date</label>
@@ -556,6 +560,16 @@ function FacilityFormModal({ facility, onClose, onSaved }) {
               </div>
             ) : null}
           </div>
+          {form.lto_type && form.facility_type && form.lto_type !== form.facility_type ? (
+            <div className="mt-4 rounded-lg bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800">
+              <p className="font-semibold">License type doesn't match facility tier</p>
+              <p className="mt-0.5 text-amber-700">
+                Hospital Level is <strong>{form.facility_type}</strong>, but LTO License Type is{' '}
+                <strong>{form.lto_type}</strong>. This can be legitimate (e.g. a level upgrade with a pending LTO
+                renewal) — just confirm it's intentional before saving.
+              </p>
+            </div>
+          ) : null}
         </div>
 
         {/* SECTION 5: SYSTEM & ROUTING CONFIG */}

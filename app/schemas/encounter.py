@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import List, Optional
 from app.schemas.patient_schema import FHIRPatient
 from datetime import datetime
@@ -30,6 +30,20 @@ class ReferralRequestSchema(BaseModel):
     subject: FHIRSubject
     reasonCode: List[FHIRReasonCode]
     patient_record: FHIRPatient
+
+    @field_validator("reasonCode")
+    @classmethod
+    def validate_reason_codes(cls, reasons: List[FHIRReasonCode]) -> List[FHIRReasonCode]:
+        if not 1 <= len(reasons) <= 4:
+            raise ValueError("reasonCode must contain one primary reason and at most three additional reasons")
+        labels = [reason.text.strip().casefold() for reason in reasons]
+        if any(not label for label in labels):
+            raise ValueError("referral reason text cannot be empty")
+        if any(len(reason.text.strip()) > 255 for reason in reasons):
+            raise ValueError("referral reason text cannot exceed 255 characters")
+        if len(labels) != len(set(labels)):
+            raise ValueError("referral reasons must be unique")
+        return reasons
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -125,6 +139,7 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     patient_age_days: Optional[int] = None
     patient_gender: str
     clinical_reason: Optional[str] = "None"
+    referral_reasons: List[dict] = Field(default_factory=list)
     diagnosis: Optional[str] = None
     chief_complaint: Optional[str] = None
     is_pwd: bool = False
@@ -146,6 +161,36 @@ class ResponsePayloadSchema(BaseModel):
     Must be either "ACCEPTED" or "REDIRECTED" [cite: 191].
     """
     decision: str
+    redirect_reason_code: Optional[str] = None
+    redirect_reason_text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_redirect_reason(self):
+        self.decision = self.decision.strip().upper()
+        allowed_decisions = {"ACCEPTED", "REDIRECTED"}
+        if self.decision not in allowed_decisions:
+            raise ValueError("decision must be ACCEPTED or REDIRECTED")
+
+        allowed_reasons = {
+            "NO_AVAILABLE_BED",
+            "SPECIALIST_UNAVAILABLE",
+            "SERVICE_UNAVAILABLE",
+            "EQUIPMENT_UNAVAILABLE",
+            "OUTSIDE_CAPABILITY",
+            "TEMPORARY_CLOSURE",
+            "OTHER",
+        }
+        if self.decision == "REDIRECTED":
+            self.redirect_reason_code = (self.redirect_reason_code or "").strip().upper()
+            self.redirect_reason_text = (self.redirect_reason_text or "").strip() or None
+            if self.redirect_reason_code not in allowed_reasons:
+                raise ValueError("a valid redirect_reason_code is required when redirecting")
+            if self.redirect_reason_code == "OTHER" and not self.redirect_reason_text:
+                raise ValueError("redirect_reason_text is required when redirect_reason_code is OTHER")
+        else:
+            self.redirect_reason_code = None
+            self.redirect_reason_text = None
+        return self
 
 
 class FinalizeReferralSchema(BaseModel):

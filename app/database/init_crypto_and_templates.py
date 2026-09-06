@@ -8,6 +8,8 @@ from app.models.facility_user import FacilityUser
 from app.models.facility_capability import FacilityCapability
 from app.models.system_credential import SystemCredential
 from app.models.used_nonce import UsedNonce
+from app.models.referral_reason import ReferralReason
+from app.models.referral_attachment import ReferralAttachment
 from app.models.assessment_models import (
     AssessmentTemplate,
     AssessmentSection,

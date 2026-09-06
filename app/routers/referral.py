@@ -1,16 +1,23 @@
 import hashlib
+import os
+import uuid
+from pathlib import Path
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, Security, status
+from urllib.parse import unquote
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security, status
 from fastapi.security import APIKeyHeader
+from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from app.models.hospitals import Facility, HospitalResources
 from app.models.facility_capability import FacilityCapability
 
 from app.models.referral_model import Referral
 from app.models.referral_response_model import ReferralResponse
+from app.models.referral_reason import ReferralReason
+from app.models.referral_attachment import ReferralAttachment
 # Import your schemas, database connections, and SQLAlchemy models
 from app.schemas.encounter import ReferralRequestSchema, ReferralResponseSchema, IncomingReferralSchema,  ResponsePayloadSchema, IncomingReferralDetailsSchema, FinalizeReferralSchema, ArriveReferralSchema, DepartReferralSchema
 from app.models.patient_model import PatientRecords
@@ -24,6 +31,59 @@ from app.utils.diagnosis_capability import derive_required_capabilities
 from app.utils.ws_manager import manager
 
 router = APIRouter()
+
+ATTACHMENT_ROOT = Path(__file__).resolve().parents[2] / "storage" / "referral_attachments"
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_ATTACHMENTS_PER_STAGE = 5
+ALLOWED_ATTACHMENT_TYPES = {
+    "PHILHEALTH_MDR", "XRAY", "LAB_RESULT", "PRESCRIPTION",
+    "DISCHARGE_SUMMARY", "OTHER",
+}
+ALLOWED_STAGE_TYPES = {
+    "REFERRAL": ALLOWED_ATTACHMENT_TYPES,
+    "DEPARTURE": ALLOWED_ATTACHMENT_TYPES - {"PHILHEALTH_MDR"},
+}
+
+
+def _serialize_referral_reasons(db: Session, referral: Referral) -> list[dict]:
+    rows = (
+        db.query(ReferralReason)
+        .filter(ReferralReason.referral_id == referral.referral_id)
+        .order_by(ReferralReason.sort_order)
+        .all()
+    )
+    if rows:
+        return [
+            {"code": row.code, "label": row.label, "is_primary": row.is_primary, "sort_order": row.sort_order}
+            for row in rows
+        ]
+    if referral.clinical_reason:
+        return [{"code": None, "label": referral.clinical_reason, "is_primary": True, "sort_order": 0}]
+    return []
+
+
+def _serialize_attachment(attachment: ReferralAttachment) -> dict:
+    return {
+        "id": attachment.id,
+        "attachment_type": attachment.attachment_type,
+        "workflow_stage": attachment.workflow_stage,
+        "original_filename": attachment.original_filename,
+        "mime_type": attachment.mime_type,
+        "size_bytes": attachment.size_bytes,
+        "sha256": attachment.sha256,
+        "uploaded_by_facility": attachment.uploaded_by_facility,
+        "uploaded_by_user": attachment.uploaded_by_user,
+        "created_at": attachment.created_at,
+        "download_url": f"/api/v1/referral/{attachment.referral_id}/attachments/{attachment.id}",
+    }
+
+
+def _can_access_referral_files(referral: Referral, hospital_name: str) -> bool:
+    caller = hospital_name.strip().casefold()
+    return caller == referral.referring_facility.strip().casefold() or bool(
+        referral.receiving_facility
+        and caller == referral.receiving_facility.strip().casefold()
+    )
 
 # Enforces that requests must send the API key in the 'X-API-Key' header
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -160,6 +220,7 @@ def get_incoming_referrals(
             "patient_age_days": ref.patient.age_days,
             "patient_gender": ref.patient.gender or "unknown",  # Read direct model column [cite: 164]
             "clinical_reason": ref.clinical_reason or "No reason provided",
+            "referral_reasons": _serialize_referral_reasons(db, ref),
             "diagnosis": ref.diagnosis,
             "chief_complaint": ref.chief_complaint,
             "is_pwd": ref.is_pwd,
@@ -260,6 +321,8 @@ async def respond_to_referral(
         # 2. Update status and save compliance metrics [cite: 315, 316]
         alert.response_status = payload.decision
         alert.responded_at = datetime.now(timezone.utc)
+        alert.redirect_reason_code = payload.redirect_reason_code
+        alert.redirect_reason_text = payload.redirect_reason_text
 
         # If they opened the form details, stamp seen_at if not already stamped [cite: 562]
         if not alert.seen_at:
@@ -274,12 +337,16 @@ async def respond_to_referral(
                 "referral_id": referral_id,
                 "hospital_name": hospital_name,
                 "responded_at": alert.responded_at.isoformat() if alert.responded_at else None,
+                "redirect_reason_code": alert.redirect_reason_code,
+                "redirect_reason_text": alert.redirect_reason_text,
             })
 
         return {
             "status": "success",
             "message": f"Referral successfully updated to {payload.decision} by {hospital_name}.",
-            "responded_at": alert.responded_at
+            "responded_at": alert.responded_at,
+            "redirect_reason_code": alert.redirect_reason_code,
+            "redirect_reason_text": alert.redirect_reason_text,
         }
 
     except Exception as e:
@@ -322,10 +389,21 @@ async def initiate_referral(
         patient_gender = getattr(payload.patient_record, "gender", "unknown") or "unknown"
         clinical_reason = "No reason provided"
         diagnosis_text = None
+        referral_reason_values = []
         if payload.reasonCode and len(payload.reasonCode) > 0:
             clinical_reason = payload.reasonCode[0].text
             if payload.reasonCode[0].coding and len(payload.reasonCode[0].coding) > 0:
                 diagnosis_text = payload.reasonCode[0].coding[0].display
+            for index, reason in enumerate(payload.reasonCode):
+                reason_code = None
+                if reason.coding and len(reason.coding) > 0:
+                    reason_code = reason.coding[0].code
+                referral_reason_values.append({
+                    "code": reason_code,
+                    "label": reason.text.strip(),
+                    "is_primary": index == 0,
+                    "sort_order": index,
+                })
 
         # Step C: Extract localized AI constraints
         patient_salary = 0.0
@@ -363,6 +441,8 @@ async def initiate_referral(
                     patient_long = float(ext.valueDecimal)
                 elif "chiefComplaint" in ext.url:
                     chief_complaint = ext.valueString
+                elif "diagnosis" in ext.url:
+                    diagnosis_text = ext.valueString
                 elif "phone" in ext.url:
                     patient_phone = ext.valueString
                 elif "address" in ext.url:
@@ -400,7 +480,8 @@ async def initiate_referral(
 
         # Step C.0: Derive which specific facility capabilities (dialysis, OB delivery,
         # neurology, etc.) this diagnosis requires, on top of the baseline severity tier
-        required_capabilities = derive_required_capabilities(diagnosis_text, chief_complaint, clinical_reason)
+        all_reason_text = " ".join(reason["label"] for reason in referral_reason_values)
+        required_capabilities = derive_required_capabilities(diagnosis_text, chief_complaint, all_reason_text or clinical_reason)
 
         # Step C.1: Derive an anonymized, non-reversible patient_code (SHA-256 of Full Name +
         # Birthdate + Sex) so the central IoL can track active-referral state network-wide
@@ -505,6 +586,9 @@ async def initiate_referral(
             created_at=datetime.now(timezone.utc)
         )
         db.add(new_referral)
+        db.flush()
+        for reason in referral_reason_values:
+            db.add(ReferralReason(referral_id=new_referral.referral_id, **reason))
 
         # Step F: Atomic Commit
         db.commit()
@@ -723,6 +807,7 @@ def get_my_referrals(
             "patient_id": readable_patient_id,
             "disease_severity": ref.disease_severity,
             "clinical_reason": ref.clinical_reason or "No reason provided",
+            "referral_reasons": _serialize_referral_reasons(db, ref),
             "status": status_value,
             "cancellable": status_value not in ("ACCEPTED", "ARRIVED", "CANCELLED"),
             "receiving_facility": ref.receiving_facility,
@@ -741,6 +826,8 @@ def get_my_referrals(
                     "response_status": r.response_status,
                     "seen_at": r.seen_at,
                     "responded_at": r.responded_at,
+                    "redirect_reason_code": r.redirect_reason_code,
+                    "redirect_reason_text": r.redirect_reason_text,
                 }
                 for r in ref_responses
             ],
@@ -966,6 +1053,16 @@ def get_referral_patient_details(
         "diagnosis": referral.diagnosis,
         "chief_complaint": referral.chief_complaint,
         "reason_text": referral.clinical_reason,
+        "referral_reasons": _serialize_referral_reasons(db, referral),
+        "attachments": [
+            _serialize_attachment(item)
+            for item in (
+                db.query(ReferralAttachment)
+                .filter(ReferralAttachment.referral_id == referral_id)
+                .order_by(ReferralAttachment.created_at)
+                .all()
+            )
+        ],
         "disease_severity": referral.disease_severity,
         "referring_facility": referral.referring_facility,
         "vital_bp": referral.vital_bp,
@@ -987,6 +1084,150 @@ def get_referral_patient_details(
         "has_allergy": referral.has_allergy,
         "allergy_details": referral.allergy_details,
     }
+
+
+@router.post("/api/v1/referral/{referral_id}/attachments", status_code=status.HTTP_201_CREATED)
+async def upload_referral_attachment(
+    referral_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital),
+):
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Referral not found.")
+
+    workflow_stage = (request.headers.get("X-Workflow-Stage") or "").strip().upper()
+    attachment_type = (request.headers.get("X-Attachment-Type") or "").strip().upper()
+    encoded_filename = request.headers.get("X-Original-Filename") or "attachment"
+    original_filename = os.path.basename(unquote(encoded_filename).replace("\\", "/")).strip()[:255]
+    original_filename = "".join(ch for ch in original_filename if ch.isprintable() and ch not in "\r\n")
+
+    if workflow_stage not in ALLOWED_STAGE_TYPES:
+        raise HTTPException(status_code=422, detail="X-Workflow-Stage must be REFERRAL or DEPARTURE.")
+    if attachment_type not in ALLOWED_STAGE_TYPES[workflow_stage]:
+        raise HTTPException(status_code=422, detail="Invalid attachment type for this workflow stage.")
+    if not original_filename:
+        raise HTTPException(status_code=422, detail="A valid original filename is required.")
+
+    caller = current_hospital_name.strip().casefold()
+    if workflow_stage == "REFERRAL":
+        if caller != referral.referring_facility.strip().casefold():
+            raise HTTPException(status_code=403, detail="Only the referring facility can upload referral attachments.")
+    else:
+        if not referral.receiving_facility or caller != referral.receiving_facility.strip().casefold():
+            raise HTTPException(status_code=403, detail="Only the finalized receiving facility can upload departure attachments.")
+        if not referral.arrived_at:
+            raise HTTPException(status_code=409, detail="Departure attachments require an arrived patient.")
+
+    existing_count = (
+        db.query(func.count(ReferralAttachment.id))
+        .filter(
+            ReferralAttachment.referral_id == referral_id,
+            ReferralAttachment.workflow_stage == workflow_stage,
+        )
+        .scalar()
+    )
+    if existing_count >= MAX_ATTACHMENTS_PER_STAGE:
+        raise HTTPException(status_code=409, detail=f"A maximum of {MAX_ATTACHMENTS_PER_STAGE} attachments is allowed per stage.")
+
+    contents = await request.body()
+    if not contents:
+        raise HTTPException(status_code=422, detail="Attachment file is empty.")
+    if len(contents) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail="Attachment exceeds the 5 MB limit.")
+
+    detected = None
+    if contents.startswith(b"%PDF-"):
+        detected = ("application/pdf", ".pdf")
+    elif contents.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected = ("image/png", ".png")
+    elif contents.startswith(b"\xff\xd8\xff"):
+        detected = ("image/jpeg", ".jpg")
+    if not detected:
+        raise HTTPException(status_code=415, detail="Only valid PDF, PNG, and JPEG files are accepted.")
+
+    mime_type, extension = detected
+    attachment_id = str(uuid.uuid4())
+    stored_filename = f"{attachment_id}{extension}"
+    referral_dir = ATTACHMENT_ROOT / referral_id
+    referral_dir.mkdir(parents=True, exist_ok=True)
+    full_path = referral_dir / stored_filename
+
+    try:
+        full_path.write_bytes(contents)
+        attachment = ReferralAttachment(
+            id=attachment_id,
+            referral_id=referral_id,
+            attachment_type=attachment_type,
+            workflow_stage=workflow_stage,
+            original_filename=original_filename,
+            stored_filename=stored_filename,
+            mime_type=mime_type,
+            size_bytes=len(contents),
+            sha256=hashlib.sha256(contents).hexdigest(),
+            uploaded_by_facility=current_hospital_name,
+            uploaded_by_user=request.headers.get("X-User-ID"),
+        )
+        db.add(attachment)
+        db.commit()
+        db.refresh(attachment)
+        return _serialize_attachment(attachment)
+    except Exception:
+        db.rollback()
+        full_path.unlink(missing_ok=True)
+        raise
+
+
+@router.get("/api/v1/referral/{referral_id}/attachments")
+def list_referral_attachments(
+    referral_id: str,
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital),
+):
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Referral not found.")
+    if not _can_access_referral_files(referral, current_hospital_name):
+        raise HTTPException(status_code=403, detail="Your facility cannot access these attachments.")
+
+    attachments = (
+        db.query(ReferralAttachment)
+        .filter(ReferralAttachment.referral_id == referral_id)
+        .order_by(ReferralAttachment.created_at)
+        .all()
+    )
+    return [_serialize_attachment(item) for item in attachments]
+
+
+@router.get("/api/v1/referral/{referral_id}/attachments/{attachment_id}")
+def download_referral_attachment(
+    referral_id: str,
+    attachment_id: str,
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital),
+):
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Referral not found.")
+    if not _can_access_referral_files(referral, current_hospital_name):
+        raise HTTPException(status_code=403, detail="Your facility cannot access this attachment.")
+
+    attachment = (
+        db.query(ReferralAttachment)
+        .filter(
+            ReferralAttachment.id == attachment_id,
+            ReferralAttachment.referral_id == referral_id,
+        )
+        .first()
+    )
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+
+    full_path = ATTACHMENT_ROOT / referral_id / attachment.stored_filename
+    if not full_path.is_file():
+        raise HTTPException(status_code=404, detail="Attachment file is missing from storage.")
+    return FileResponse(full_path, media_type=attachment.mime_type, filename=attachment.original_filename)
 
 
 @router.get("/api/v1/referral/outcomes")
@@ -1035,6 +1276,7 @@ def get_referral_outcomes(
             "patient_gender": (ref.patient.gender if ref.patient and ref.patient.gender else "unknown"),
             "disease_severity": ref.disease_severity,
             "clinical_reason": ref.clinical_reason or "No reason provided",
+            "referral_reasons": _serialize_referral_reasons(db, ref),
             "created_at": ref.created_at,
             "seen_at": resp.seen_at,
             "responded_at": resp.responded_at,
@@ -1050,24 +1292,38 @@ def get_referral_outcomes(
 
 @router.get("/api/v1/referral/analytics")
 def get_facility_analytics(
+    start_date: Optional[date] = Query(None, description="Inclusive referral creation date"),
+    end_date: Optional[date] = Query(None, description="Inclusive referral creation date"),
     db: Session = Depends(get_db),
     current_hospital_name: str = Depends(get_current_hospital)
 ):
     """
     Facility-admin-facing aggregates that the outcome counters on Incoming Patients
-    don't cover: what this facility refers patients out FOR (top reasons), who sends
-    patients TO this facility, who this facility sends patients TO, and monthly
+    don't cover: why this facility sends and receives referrals, who sends patients
+    TO this facility, who this facility sends patients TO, and monthly
     referral volume in both directions. Outcome counters themselves (Transferred To
     Us / Discharged / Referred Onward / etc.) are intentionally NOT duplicated here --
     the frontend reuses /api/v1/referral/outcomes so the two views can never drift
     apart on those numbers.
     """
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_date must be on or before end_date."
+        )
+
     name = current_hospital_name.strip()
+    date_filters = []
+    if start_date:
+        date_filters.append(Referral.created_at >= datetime.combine(start_date, time.min))
+    if end_date:
+        # Use an exclusive upper bound so all times on end_date are included.
+        date_filters.append(Referral.created_at < datetime.combine(end_date + timedelta(days=1), time.min))
 
     def top_n(column, filter_condition, limit=10):
         rows = (
             db.query(column.label("label"), func.count(Referral.referral_id).label("count"))
-            .filter(filter_condition, column.isnot(None), column != "")
+            .filter(filter_condition, *date_filters, column.isnot(None), column != "")
             .group_by(column)
             .order_by(func.count(Referral.referral_id).desc())
             .limit(limit)
@@ -1078,6 +1334,10 @@ def get_facility_analytics(
     top_reasons = top_n(
         Referral.clinical_reason,
         func.lower(Referral.referring_facility) == name.lower()
+    )
+    top_incoming_reasons = top_n(
+        Referral.clinical_reason,
+        func.lower(Referral.receiving_facility) == name.lower()
     )
     top_senders = top_n(
         Referral.referring_facility,
@@ -1091,14 +1351,14 @@ def get_facility_analytics(
     month = func.date_trunc("month", Referral.created_at)
     sent_rows = (
         db.query(month.label("month"), func.count(Referral.referral_id).label("count"))
-        .filter(func.lower(Referral.referring_facility) == name.lower())
+        .filter(func.lower(Referral.referring_facility) == name.lower(), *date_filters)
         .group_by(month)
         .order_by(month)
         .all()
     )
     received_rows = (
         db.query(month.label("month"), func.count(Referral.referral_id).label("count"))
-        .filter(func.lower(Referral.receiving_facility) == name.lower())
+        .filter(func.lower(Referral.receiving_facility) == name.lower(), *date_filters)
         .group_by(month)
         .order_by(month)
         .all()
@@ -1113,9 +1373,14 @@ def get_facility_analytics(
 
     return {
         "top_reasons": top_reasons,
+        "top_incoming_reasons": top_incoming_reasons,
         "top_senders": top_senders,
         "top_receivers": top_receivers,
         "monthly_volume": monthly_volume,
+        "period": {
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
     }
 
 
@@ -1233,4 +1498,4 @@ async def mark_referral_departed(
         "referral_id": referral.referral_id,
         "departed_at": referral.departed_at,
         "departure_outcome": referral.departure_outcome
-    }
+    }

@@ -14,6 +14,8 @@ from app.models.api_key import APIKey
 from app.models.admin import Admin
 from app.models import referral_model
 from app.models.referral_response_model import ReferralResponse
+from app.models.referral_reason import ReferralReason
+from app.models.referral_attachment import ReferralAttachment
 
 
 # this is the Alembic Config object, which provides
