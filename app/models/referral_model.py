@@ -84,6 +84,14 @@ class Referral(Base):
     has_allergy: Mapped[bool] = mapped_column(default=False, nullable=False)
     allergy_details: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    # Consent audit metadata supplied by the referring facility. A scanned signed
+    # form, when available, is stored separately as a protected CONSENT_FORM attachment.
+    consent_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    consent_method: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    consent_text_version: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    consent_recorded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    consent_witnessed_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
     # Performance auditing timestamps to calculate LGU response times [5]
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

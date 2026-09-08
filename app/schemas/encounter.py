@@ -140,6 +140,8 @@ class IncomingReferralDetailsSchema(IncomingReferralSchema):
     patient_gender: str
     clinical_reason: Optional[str] = "None"
     referral_reasons: List[dict] = Field(default_factory=list)
+    consent_status: Optional[str] = None
+    consent_method: Optional[str] = None
     diagnosis: Optional[str] = None
     chief_complaint: Optional[str] = None
     is_pwd: bool = False

@@ -37,7 +37,7 @@ MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENTS_PER_STAGE = 5
 ALLOWED_ATTACHMENT_TYPES = {
     "PHILHEALTH_MDR", "XRAY", "LAB_RESULT", "PRESCRIPTION",
-    "DISCHARGE_SUMMARY", "OTHER",
+    "DISCHARGE_SUMMARY", "CONSENT_FORM", "OTHER",
 }
 ALLOWED_STAGE_TYPES = {
     "REFERRAL": ALLOWED_ATTACHMENT_TYPES,
@@ -221,6 +221,8 @@ def get_incoming_referrals(
             "patient_gender": ref.patient.gender or "unknown",  # Read direct model column [cite: 164]
             "clinical_reason": ref.clinical_reason or "No reason provided",
             "referral_reasons": _serialize_referral_reasons(db, ref),
+            "consent_status": ref.consent_status,
+            "consent_method": ref.consent_method,
             "diagnosis": ref.diagnosis,
             "chief_complaint": ref.chief_complaint,
             "is_pwd": ref.is_pwd,
@@ -428,6 +430,11 @@ async def initiate_referral(
         is_senior_citizen = False
         has_allergy = False
         allergy_details = None
+        consent_status = None
+        consent_method = None
+        consent_text_version = None
+        consent_recorded_at = None
+        consent_witnessed_by = None
 
         if payload.patient_record.extension:
             for ext in payload.patient_record.extension:
@@ -477,6 +484,36 @@ async def initiate_referral(
                     has_allergy = bool(ext.valueBoolean)
                 elif "allergyDetails" in ext.url:
                     allergy_details = ext.valueString
+                elif "consentStatus" in ext.url:
+                    consent_status = ext.valueString
+                elif "consentMethod" in ext.url:
+                    consent_method = ext.valueString
+                elif "consentTextVersion" in ext.url:
+                    consent_text_version = ext.valueString
+                elif "consentRecordedAt" in ext.url:
+                    try:
+                        consent_recorded_at = datetime.fromisoformat((ext.valueString or "").replace("Z", "+00:00"))
+                    except ValueError:
+                        consent_recorded_at = None
+                elif "consentWitnessedBy" in ext.url:
+                    consent_witnessed_by = ext.valueString
+
+        if (
+            (consent_status or "").strip().upper() != "GRANTED"
+            or (consent_method or "").strip().upper() not in {"PAPER", "ELECTRONIC"}
+            or not (consent_text_version or "").strip()
+            or consent_recorded_at is None
+            or not (consent_witnessed_by or "").strip()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Valid patient referral consent metadata is required.",
+            )
+
+        consent_status = consent_status.strip().upper()
+        consent_method = consent_method.strip().upper()
+        consent_text_version = consent_text_version.strip()[:50]
+        consent_witnessed_by = consent_witnessed_by.strip()[:255]
 
         # Step C.0: Derive which specific facility capabilities (dialysis, OB delivery,
         # neurology, etc.) this diagnosis requires, on top of the baseline severity tier
@@ -582,6 +619,11 @@ async def initiate_referral(
             is_senior_citizen=is_senior_citizen,
             has_allergy=has_allergy,
             allergy_details=allergy_details,
+            consent_status=consent_status,
+            consent_method=consent_method,
+            consent_text_version=consent_text_version,
+            consent_recorded_at=consent_recorded_at,
+            consent_witnessed_by=consent_witnessed_by,
             status="CREATED",
             created_at=datetime.now(timezone.utc)
         )
@@ -808,6 +850,11 @@ def get_my_referrals(
             "disease_severity": ref.disease_severity,
             "clinical_reason": ref.clinical_reason or "No reason provided",
             "referral_reasons": _serialize_referral_reasons(db, ref),
+            "consent_status": ref.consent_status,
+            "consent_method": ref.consent_method,
+            "consent_text_version": ref.consent_text_version,
+            "consent_recorded_at": ref.consent_recorded_at,
+            "consent_witnessed_by": ref.consent_witnessed_by,
             "status": status_value,
             "cancellable": status_value not in ("ACCEPTED", "ARRIVED", "CANCELLED"),
             "receiving_facility": ref.receiving_facility,
@@ -1083,6 +1130,11 @@ def get_referral_patient_details(
         "is_senior_citizen": referral.is_senior_citizen,
         "has_allergy": referral.has_allergy,
         "allergy_details": referral.allergy_details,
+        "consent_status": referral.consent_status,
+        "consent_method": referral.consent_method,
+        "consent_text_version": referral.consent_text_version,
+        "consent_recorded_at": referral.consent_recorded_at,
+        "consent_witnessed_by": referral.consent_witnessed_by,
     }
 
 
@@ -1120,16 +1172,24 @@ async def upload_referral_attachment(
         if not referral.arrived_at:
             raise HTTPException(status_code=409, detail="Departure attachments require an arrived patient.")
 
+    count_filters = [
+        ReferralAttachment.referral_id == referral_id,
+        ReferralAttachment.workflow_stage == workflow_stage,
+    ]
+    if attachment_type == "CONSENT_FORM":
+        count_filters.append(ReferralAttachment.attachment_type == "CONSENT_FORM")
+        attachment_limit = 1
+    else:
+        count_filters.append(ReferralAttachment.attachment_type != "CONSENT_FORM")
+        attachment_limit = MAX_ATTACHMENTS_PER_STAGE
     existing_count = (
         db.query(func.count(ReferralAttachment.id))
-        .filter(
-            ReferralAttachment.referral_id == referral_id,
-            ReferralAttachment.workflow_stage == workflow_stage,
-        )
+        .filter(*count_filters)
         .scalar()
     )
-    if existing_count >= MAX_ATTACHMENTS_PER_STAGE:
-        raise HTTPException(status_code=409, detail=f"A maximum of {MAX_ATTACHMENTS_PER_STAGE} attachments is allowed per stage.")
+    if existing_count >= attachment_limit:
+        limit_message = "Only one signed consent form is allowed." if attachment_type == "CONSENT_FORM" else f"A maximum of {MAX_ATTACHMENTS_PER_STAGE} clinical attachments is allowed per stage."
+        raise HTTPException(status_code=409, detail=limit_message)
 
     contents = await request.body()
     if not contents:
