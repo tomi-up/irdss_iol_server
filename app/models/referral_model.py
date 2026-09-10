@@ -91,6 +91,12 @@ class Referral(Base):
     consent_text_version: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     consent_recorded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     consent_witnessed_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    consent_signer_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    # Signer identity and relationship can disclose patient/representative identity,
+    # so these values use the same AES-at-rest treatment as patient identity fields.
+    consent_signer_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    consent_representative_relationship: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    consent_document_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # Performance auditing timestamps to calculate LGU response times [5]
     created_at: Mapped[datetime] = mapped_column(

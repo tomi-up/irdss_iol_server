@@ -435,6 +435,10 @@ async def initiate_referral(
         consent_text_version = None
         consent_recorded_at = None
         consent_witnessed_by = None
+        consent_signer_type = None
+        consent_signer_name = None
+        consent_representative_relationship = None
+        consent_document_sha256 = None
 
         if payload.patient_record.extension:
             for ext in payload.patient_record.extension:
@@ -497,11 +501,19 @@ async def initiate_referral(
                         consent_recorded_at = None
                 elif "consentWitnessedBy" in ext.url:
                     consent_witnessed_by = ext.valueString
+                elif "consentSignerType" in ext.url:
+                    consent_signer_type = ext.valueString
+                elif "consentSignerName" in ext.url:
+                    consent_signer_name = ext.valueString
+                elif "consentRepresentativeRelationship" in ext.url:
+                    consent_representative_relationship = ext.valueString
+                elif "consentDocumentSha256" in ext.url:
+                    consent_document_sha256 = ext.valueString
 
         if (
             (consent_status or "").strip().upper() != "GRANTED"
             or (consent_method or "").strip().upper() not in {"PAPER", "ELECTRONIC"}
-            or not (consent_text_version or "").strip()
+            or (consent_text_version or "").strip() != "referral-consent-2026-09-v1"
             or consent_recorded_at is None
             or not (consent_witnessed_by or "").strip()
         ):
@@ -514,6 +526,30 @@ async def initiate_referral(
         consent_method = consent_method.strip().upper()
         consent_text_version = consent_text_version.strip()[:50]
         consent_witnessed_by = consent_witnessed_by.strip()[:255]
+        if consent_recorded_at.tzinfo is None:
+            consent_recorded_at = consent_recorded_at.replace(tzinfo=timezone.utc)
+        if consent_method == "ELECTRONIC" and abs((datetime.now(timezone.utc) - consent_recorded_at).total_seconds()) > 1800:
+            raise HTTPException(status_code=422, detail="Electronic consent has expired. Please review and sign it again.")
+        if consent_method == "ELECTRONIC":
+            consent_signer_type = (consent_signer_type or "").strip().upper()
+            consent_signer_name = (consent_signer_name or "").strip()
+            consent_representative_relationship = (consent_representative_relationship or "").strip()
+            consent_document_sha256 = (consent_document_sha256 or "").strip().lower()
+            if consent_signer_type not in {"PATIENT", "PARENT_GUARDIAN", "AUTHORIZED_REPRESENTATIVE"}:
+                raise HTTPException(status_code=422, detail="Electronic consent has an invalid signer type.")
+            if not consent_signer_name or len(consent_signer_name) > 255:
+                raise HTTPException(status_code=422, detail="Electronic consent requires the signer's full name.")
+            if consent_signer_type != "PATIENT" and (
+                not consent_representative_relationship or len(consent_representative_relationship) > 100
+            ):
+                raise HTTPException(status_code=422, detail="Electronic consent requires the representative relationship.")
+            if len(consent_document_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in consent_document_sha256):
+                raise HTTPException(status_code=422, detail="Electronic consent requires a valid SHA-256 document hash.")
+        else:
+            consent_signer_type = None
+            consent_signer_name = None
+            consent_representative_relationship = None
+            consent_document_sha256 = None
 
         # Step C.0: Derive which specific facility capabilities (dialysis, OB delivery,
         # neurology, etc.) this diagnosis requires, on top of the baseline severity tier
@@ -531,6 +567,8 @@ async def initiate_referral(
         # never on PatientRecords. Only ever decrypted by the finalized receiving facility via
         # GET /api/v1/referral/{id}/patient-details.
         full_name = (payload.subject.display or f"{given_name} {family_name}".strip()) if payload.subject else f"{given_name} {family_name}".strip()
+        if consent_method == "ELECTRONIC" and consent_signer_type == "PATIENT" and consent_signer_name.casefold() != full_name.casefold():
+            raise HTTPException(status_code=422, detail="A patient signature must use the selected patient's full name.")
         encrypted_full_name = aes_encrypt(full_name) if full_name else None
         encrypted_dob = aes_encrypt(payload.patient_record.birthDate) if payload.patient_record.birthDate else None
         encrypted_phone = aes_encrypt(patient_phone) if patient_phone else None
@@ -538,6 +576,8 @@ async def initiate_referral(
         encrypted_civil_status = aes_encrypt(patient_civil_status) if patient_civil_status else None
         encrypted_philhealth_number = aes_encrypt(patient_philhealth_number) if patient_philhealth_number else None
         encrypted_philhealth_status = aes_encrypt(patient_philhealth_status) if patient_philhealth_status else None
+        encrypted_consent_signer_name = aes_encrypt(consent_signer_name) if consent_signer_name else None
+        encrypted_consent_relationship = aes_encrypt(consent_representative_relationship) if consent_representative_relationship else None
 
         # Step C.2: Block a second active referral for the same patient anywhere in the network.
         candidate_referrals = db.query(Referral).filter(
@@ -624,6 +664,10 @@ async def initiate_referral(
             consent_text_version=consent_text_version,
             consent_recorded_at=consent_recorded_at,
             consent_witnessed_by=consent_witnessed_by,
+            consent_signer_type=consent_signer_type,
+            consent_signer_name=encrypted_consent_signer_name,
+            consent_representative_relationship=encrypted_consent_relationship,
+            consent_document_sha256=consent_document_sha256,
             status="CREATED",
             created_at=datetime.now(timezone.utc)
         )
@@ -746,6 +790,11 @@ def _compute_referral_status(referral: Referral, responses: list[ReferralRespons
     """
     if referral.status == "CANCELLED":
         return "CANCELLED"
+    # Departure is the terminal state of the receiving episode and must take
+    # precedence over arrival. Previously every departed patient stayed ARRIVED
+    # forever because arrived_at was checked first.
+    if referral.departed_at:
+        return (referral.departure_outcome or "DEPARTED").strip().upper()
     if referral.arrived_at:
         return "ARRIVED"
     if any(r.response_status == "ACCEPTED" for r in responses):
@@ -832,6 +881,11 @@ def get_my_referrals(
             readable_patient_id = ref.patient_id
 
         status_value = _compute_referral_status(ref, ref_responses)
+        # A new referral created by the receiving hospital represents a distinct
+        # onward transfer. The source referral remains linked to that new record,
+        # but its display status should describe the outcome of this episode.
+        if not ref.departed_at and onward_by_source_referral.get(ref.referral_id):
+            status_value = "REFERRED_ONWARD"
 
         # The "Accepted" timeline step should reflect whichever response actually won --
         # the finalized hospital's acceptance if chosen, otherwise the first acceptance
@@ -856,7 +910,10 @@ def get_my_referrals(
             "consent_recorded_at": ref.consent_recorded_at,
             "consent_witnessed_by": ref.consent_witnessed_by,
             "status": status_value,
-            "cancellable": status_value not in ("ACCEPTED", "ARRIVED", "CANCELLED"),
+            "cancellable": status_value not in (
+                "ACCEPTED", "ARRIVED", "CANCELLED", "DISCHARGED", "TRANSFERRED",
+                "DECEASED", "LEFT_AMA", "DEPARTED", "REFERRED_ONWARD",
+            ),
             "receiving_facility": ref.receiving_facility,
             "created_at": ref.created_at,
             "seen_at": ref.seen_at,
@@ -1135,6 +1192,10 @@ def get_referral_patient_details(
         "consent_text_version": referral.consent_text_version,
         "consent_recorded_at": referral.consent_recorded_at,
         "consent_witnessed_by": referral.consent_witnessed_by,
+        "consent_signer_type": referral.consent_signer_type,
+        "consent_signer_name": safe_decrypt(referral.consent_signer_name),
+        "consent_representative_relationship": safe_decrypt(referral.consent_representative_relationship),
+        "consent_document_sha256": referral.consent_document_sha256,
     }
 
 
@@ -1208,6 +1269,14 @@ async def upload_referral_attachment(
         raise HTTPException(status_code=415, detail="Only valid PDF, PNG, and JPEG files are accepted.")
 
     mime_type, extension = detected
+    content_sha256 = hashlib.sha256(contents).hexdigest()
+    if (
+        attachment_type == "CONSENT_FORM"
+        and referral.consent_method == "ELECTRONIC"
+        and referral.consent_document_sha256
+        and content_sha256 != referral.consent_document_sha256
+    ):
+        raise HTTPException(status_code=422, detail="Electronic consent document hash does not match the recorded consent.")
     attachment_id = str(uuid.uuid4())
     stored_filename = f"{attachment_id}{extension}"
     referral_dir = ATTACHMENT_ROOT / referral_id
@@ -1225,7 +1294,7 @@ async def upload_referral_attachment(
             stored_filename=stored_filename,
             mime_type=mime_type,
             size_bytes=len(contents),
-            sha256=hashlib.sha256(contents).hexdigest(),
+            sha256=content_sha256,
             uploaded_by_facility=current_hospital_name,
             uploaded_by_user=request.headers.get("X-User-ID"),
         )
