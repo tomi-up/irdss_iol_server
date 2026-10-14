@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0",
+  "loinc_system": "http://loinc.org",
+  "ucum_system": "http://unitsofmeasure.org",
+  "blood_pressure": {"code": "85354-9", "display": "Blood pressure panel with all children optional", "components": [
+    {"code": "8480-6", "display": "Systolic blood pressure", "unit": "mm[Hg]", "unit_display": "mmHg"},
+    {"code": "8462-4", "display": "Diastolic blood pressure", "unit": "mm[Hg]", "unit_display": "mmHg"}
+  ]},
+  "measurements": {
+    "vital_hr": {"code": "8867-4", "display": "Heart rate", "unit": "/min", "unit_display": "bpm"},
+    "vital_rr": {"code": "9279-1", "display": "Respiratory rate", "unit": "/min", "unit_display": "breaths/min"},
+    "vital_temp_c": {"code": "8310-5", "display": "Body temperature", "unit": "Cel", "unit_display": "°C"},
+    "vital_o2sat": {"code": "2708-6", "display": "Oxygen saturation in arterial blood", "unit": "%", "unit_display": "%"},
+    "vital_height_cm": {"code": "8302-2", "display": "Body height", "unit": "cm", "unit_display": "cm"},
+    "vital_weight_kg": {"code": "29463-7", "display": "Body weight", "unit": "kg", "unit_display": "kg"}
+  },
+  "pulse_oximetry": {"code": "59408-5", "display": "Oxygen saturation in arterial blood by pulse oximetry"}
+}

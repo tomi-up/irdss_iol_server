@@ -1,0 +1,23 @@
+{
+  "resourceType": "ValueSet",
+  "id": "condition-severity",
+  "url": "http://hl7.org/fhir/ValueSet/condition-severity",
+  "version": "4.0.1",
+  "name": "Condition/DiagnosisSeverity",
+  "title": "Condition/Diagnosis Severity",
+  "status": "draft",
+  "publisher": "HL7 International",
+  "description": "Source-controlled FHIR R4 reference snapshot. Condition severity is optional in IRDSS and is distinct from triage acuity and referral priority.",
+  "compose": {
+    "include": [
+      {
+        "system": "http://snomed.info/sct",
+        "concept": [
+          { "code": "24484000", "display": "Severe" },
+          { "code": "6736007", "display": "Moderate severity" },
+          { "code": "255604002", "display": "Mild" }
+        ]
+      }
+    ]
+  }
+}

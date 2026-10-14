@@ -24,3 +24,5 @@ class ReferralResponse(Base):
     # Clinical M&E Audit Metrics (To track 15-to-30 minute emergency turnaround rules!) [cite: 306, 307]
     seen_at = Column(DateTime, nullable=True)  # When the receiving ER doctor opened the case details [cite: 194, 203]
     responded_at = Column(DateTime, nullable=True)  # When they clicked Accept/Redirect [cite: 194]
+    redirect_reason_code = Column(String(100), nullable=True)
+    redirect_reason_text = Column(String(500), nullable=True)

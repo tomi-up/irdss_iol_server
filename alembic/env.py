@@ -4,10 +4,21 @@ from sqlalchemy import pool
 from alembic import context
 from app.database.db_connection import Base
 from app.models.patient_model import PatientRecords
-from app.models.hospitals import HospitalResources
+from app.models.hospitals import Facility
+from app.models.facility_user import FacilityUser
+from app.models.facility_capability import FacilityCapability
+from app.models.system_credential import SystemCredential
+from app.models.used_nonce import UsedNonce
+from app.models.assessment_models import FacilityAssessment, AssessmentAnswer
 from app.models.api_key import APIKey
+from app.models.admin import Admin
 from app.models import referral_model
 from app.models.referral_response_model import ReferralResponse
+from app.models.referral_reason import ReferralReason
+from app.models.referral_attachment import ReferralAttachment
+from app.models.referral_urgency_audit import ReferralUrgencyAudit
+from app.models.referral_clinical_resource import ReferralClinicalResource
+
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

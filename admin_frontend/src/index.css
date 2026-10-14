@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');
+@import 'tailwindcss';
+
+/* TailAdmin-referenced design tokens: Outfit type, solid red-600 as the one brand
+   color (no gradients), matching mock_hospitals' palette. */
+@theme {
+  --font-sans: 'Outfit', system-ui, 'Segoe UI', Roboto, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  background: #f8fafc;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #fef2f2;
+}
+::-webkit-scrollbar-thumb {
+  background: #f87171;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #dc2626;
+}
