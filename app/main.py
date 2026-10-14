@@ -1,4 +1,5 @@
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -8,12 +9,20 @@ from starlette.middleware.cors import CORSMiddleware
 from app.routers import admin, admin_auth, referral, hospitals
 from app.utils.rate_limit import DEFAULT_LIMIT_ITEM, key_by_api_key_or_ip, limiter
 from app.utils.request_log import record_request
+from app.database.maintenance import run_startup_database_maintenance
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    run_startup_database_maintenance()
+    yield
 
 # Initialize the FastAPI application gateway
 app = FastAPI(
     title="IRDSS Interoperability Layer API",
     description="API Gateway for the Mindanao-wide Intelligent Referral Decision Support System.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 origins = [
     "http://localhost",
@@ -113,7 +122,7 @@ async def monitor_requests(request: Request, call_next):
 from fastapi.staticfiles import StaticFiles
 import os
 
-from app.routers import admin, admin_auth, referral, hospitals, facility_auth, assessments, ws
+from app.routers import admin, admin_auth, referral, hospitals, facility_auth, assessments, terminology, ws
 
 # Ensure storage directory exists for LTO file uploads
 os.makedirs("storage/lto_files", exist_ok=True)
@@ -126,6 +135,7 @@ app.include_router(facility_auth.router)
 app.include_router(referral.router)
 app.include_router(hospitals.router)
 app.include_router(assessments.router)
+app.include_router(terminology.router)
 app.include_router(ws.router)
 
 
@@ -139,4 +149,3 @@ app.include_router(admin.router)
 @app.get("/")
 async def root():
     return {"message": "Welcome to the IRDSS Interoperability Layer API. The server is live and secure."}
-

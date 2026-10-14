@@ -16,6 +16,8 @@ from app.models import referral_model
 from app.models.referral_response_model import ReferralResponse
 from app.models.referral_reason import ReferralReason
 from app.models.referral_attachment import ReferralAttachment
+from app.models.referral_urgency_audit import ReferralUrgencyAudit
+from app.models.referral_clinical_resource import ReferralClinicalResource
 
 
 # this is the Alembic Config object, which provides

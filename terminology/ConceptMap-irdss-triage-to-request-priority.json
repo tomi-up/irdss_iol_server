@@ -1,0 +1,82 @@
+{
+  "resourceType": "ConceptMap",
+  "id": "irdss-triage-to-request-priority",
+  "url": "https://irdss.gov.ph/fhir/ConceptMap/triage-to-request-priority",
+  "version": "0.1.0",
+  "name": "IRDSSTriageToRequestPriority",
+  "title": "IRDSS Triage Acuity to FHIR Request Priority",
+  "status": "draft",
+  "experimental": true,
+  "date": "2026-10-06",
+  "publisher": "IRDSS Project",
+  "description": "Prototype operational mapping from IRDSS triage acuity to FHIR ServiceRequest.priority. The mapping is related, not semantically equivalent, and requires formal clinical approval before production use.",
+  "sourceCanonical": "https://irdss.gov.ph/fhir/ValueSet/triage-acuity|0.1.0",
+  "targetCanonical": "http://hl7.org/fhir/ValueSet/request-priority",
+  "group": [
+    {
+      "source": "https://irdss.gov.ph/fhir/CodeSystem/triage-acuity",
+      "sourceVersion": "0.1.0",
+      "target": "http://hl7.org/fhir/request-priority",
+      "element": [
+        {
+          "code": "1",
+          "display": "Mild",
+          "target": [
+            {
+              "code": "routine",
+              "display": "Routine",
+              "equivalence": "relatedto"
+            }
+          ]
+        },
+        {
+          "code": "2",
+          "display": "Moderate",
+          "target": [
+            {
+              "code": "routine",
+              "display": "Routine",
+              "equivalence": "relatedto"
+            }
+          ]
+        },
+        {
+          "code": "3",
+          "display": "Severe",
+          "target": [
+            {
+              "code": "urgent",
+              "display": "Urgent",
+              "equivalence": "relatedto",
+              "comment": "Requires immediate notification."
+            }
+          ]
+        },
+        {
+          "code": "4",
+          "display": "Critical",
+          "target": [
+            {
+              "code": "asap",
+              "display": "ASAP",
+              "equivalence": "relatedto",
+              "comment": "Requires immediate notification."
+            }
+          ]
+        },
+        {
+          "code": "5",
+          "display": "Extreme",
+          "target": [
+            {
+              "code": "stat",
+              "display": "STAT",
+              "equivalence": "relatedto",
+              "comment": "Requires immediate notification and deterministic emergency routing to the most capable eligible available facility."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

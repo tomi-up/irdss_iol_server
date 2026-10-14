@@ -20,7 +20,12 @@ export function clearStoredKey() {
 function extractDetail(payload, fallback) {
   if (!payload) return fallback
   const { detail } = payload
-  if (typeof detail === 'string') return detail
+  if (typeof detail === 'string') {
+    const exposesServerInternals = /(sqlalchemy|psycopg|invalid input syntax|\[sql:|background on this error|traceback)/i.test(detail)
+    return exposesServerInternals
+      ? 'The server could not complete the request. Please check the submitted values and try again.'
+      : detail
+  }
   if (Array.isArray(detail)) {
     return detail.map((d) => d.msg || JSON.stringify(d)).join('; ')
   }

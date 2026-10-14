@@ -25,6 +25,16 @@ const OWNERSHIP_OPTIONS = ['Government', 'Private']
 const LTO_STATUS_OPTIONS = ['Active', 'Expired', 'Suspended', 'Pending']
 const FACILITY_STATUS_OPTIONS = ['Active', 'Inactive']
 
+const LEGACY_FACILITY_TYPE_MAP = {
+  'Hospital Level 1': 'Level 1 Hospital',
+  'Hospital Level 2': 'Level 2 Hospital',
+  'Hospital Level 3': 'Level 3 Hospital',
+}
+
+function normalizeFacilityType(value) {
+  return LEGACY_FACILITY_TYPE_MAP[value] ?? value ?? ''
+}
+
 const BLANK_FORM = {
   facility_name: '',
   facility_type: 'Level 1 Hospital',
@@ -52,7 +62,7 @@ function formFromFacility(facility) {
   if (!facility) return BLANK_FORM
   return {
     facility_name: facility.facility_name ?? '',
-    facility_type: facility.facility_type ?? 'Level 1 Hospital',
+    facility_type: normalizeFacilityType(facility.facility_type) || 'Level 1 Hospital',
     ownership: facility.ownership ?? 'Government',
     facility_head: facility.facility_head ?? '',
     region: facility.region ?? 'Region XI',
@@ -65,7 +75,7 @@ function formFromFacility(facility) {
     contact_number: facility.contact_number ?? '',
     email: facility.email ?? '',
     lto_number: facility.lto_number ?? '',
-    lto_type: facility.lto_type ?? '',
+    lto_type: normalizeFacilityType(facility.lto_type),
     lto_issue_date: facility.lto_issue_date ?? '',
     lto_expiration_date: facility.lto_expiration_date ?? '',
     lto_status: facility.lto_status ?? 'Active',
@@ -230,13 +240,30 @@ function FacilityFormModal({ facility, onClose, onSaved }) {
     setError('')
     try {
       if (facility) {
-        // Edit mode (JSON PATCH)
-        const payload = {
+        // Edit mode: send a true partial PATCH so untouched values remain exactly
+        // as stored, including optional fields that the user does not want to edit.
+        const normalizedForm = {
           ...form,
           facility_name: form.facility_name.trim(),
           latitude: Number(form.latitude) || 0,
           longitude: Number(form.longitude) || 0,
           pso_daily_routing_limit: Number(form.pso_daily_routing_limit) || 5,
+        }
+        const original = formFromFacility(facility)
+        const normalizedOriginal = {
+          ...original,
+          facility_name: original.facility_name.trim(),
+          latitude: Number(original.latitude) || 0,
+          longitude: Number(original.longitude) || 0,
+          pso_daily_routing_limit: Number(original.pso_daily_routing_limit) || 5,
+        }
+        const payload = Object.fromEntries(
+          Object.entries(normalizedForm).filter(([key, value]) => value !== normalizedOriginal[key])
+        )
+
+        if (Object.keys(payload).length === 0) {
+          onClose()
+          return
         }
         await adminApi.updateFacility(facility.id, payload)
       } else {

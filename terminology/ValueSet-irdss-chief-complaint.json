@@ -1,0 +1,25 @@
+{
+  "resourceType": "ValueSet",
+  "id": "irdss-chief-complaint",
+  "url": "https://irdss.gov.ph/fhir/ValueSet/chief-complaint",
+  "version": "0.1.0",
+  "status": "draft",
+  "experimental": true,
+  "compose": {
+    "include": [
+      {
+        "system": "http://snomed.info/sct",
+        "concept": [
+          {"code": "25064002", "display": "Headache"},
+          {"code": "404640003", "display": "Dizziness"},
+          {"code": "386661006", "display": "Fever"},
+          {"code": "49727002", "display": "Cough"},
+          {"code": "267036007", "display": "Dyspnea"},
+          {"code": "29857009", "display": "Chest pain"},
+          {"code": "21522001", "display": "Abdominal pain"},
+          {"code": "422400008", "display": "Vomiting"}
+        ]
+      }
+    ]
+  }
+}

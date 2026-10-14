@@ -6,6 +6,7 @@ environment root key or an active SYSTEM_ADMIN credential. These are the only
 endpoints in the gateway that intentionally read across tenant boundaries.
 """
 
+import logging
 import os
 import time
 import uuid
@@ -63,6 +64,8 @@ from app.utils.request_log import (
     get_traffic_summary,
     get_uptime_seconds,
 )
+
+logger = logging.getLogger(__name__)
 from app.utils.security import (
     aes_decrypt,
     generate_irdss_api_key,
@@ -555,12 +558,20 @@ async def update_facility(
                 )
 
         for field, value in update_data.items():
-            if value is not None:
-                if field in ("lto_issue_date", "lto_expiration_date") and isinstance(value, str):
+            if field in ("lto_issue_date", "lto_expiration_date"):
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    setattr(facility, field, None)
+                    continue
+                if isinstance(value, str):
                     try:
-                        value = datetime.strptime(value, "%Y-%m-%d").date()
-                    except ValueError:
-                        pass
+                        value = datetime.strptime(value.strip(), "%Y-%m-%d").date()
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"{field.replace('_', ' ').title()} must be a valid date.",
+                        ) from exc
+
+            if value is not None:
                 setattr(facility, field, value.strip() if isinstance(value, str) else value)
 
         db.commit()
@@ -583,9 +594,10 @@ async def update_facility(
         raise
     except Exception as e:
         db.rollback()
+        logger.exception("Failed to update facility %s", facility_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update facility: {str(e)}"
+            detail="Failed to update facility. Please check the submitted values and try again."
         )
 
 

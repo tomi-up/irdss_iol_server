@@ -28,7 +28,24 @@ from app.database.db_connection import get_db
 from app.ai.routing_filter import get_qualified_broadcast_targets
 from app.ai.fcm_matching import compute_compatibility_scores
 from app.utils.diagnosis_capability import derive_required_capabilities
+from app.services.referral_number import next_referral_number
+from app.services.clinical_diagnosis import resolve_diagnosis, diagnosis_fields
+from app.services.clinical_complaint import resolve_chief_complaint, complaint_fields
+from app.services.clinical_urgency import resolve_urgency, urgency_fields, urgency_policy
+from app.models.referral_urgency_audit import ReferralUrgencyAudit
+from app.schemas.encounter import ClinicalUrgencyRequest
+from app.services.emergency_routing import order_emergency_candidates
+from app.services.fhir_clinical import parse_clinical_bundle, persist_resources, persist_observations, resource_bundle, observation_details
+from app.services.fhir_clinical import arrival_clinical_resources, sync_clinical_urgency
+from app.services.fhir_clinical import arrival_value_snapshot
+from pydantic import Field
 from app.utils.ws_manager import manager
+from app.services.patient_identity_vault import (
+    PatientIdentityVaultError,
+    delete_patient_identity,
+    load_patient_identity,
+)
+from app.services.direct_patient_transfer import issue_ticket, verify_ticket, facility_entry
 
 router = APIRouter()
 
@@ -205,6 +222,7 @@ def get_incoming_referrals(
             # Transactional fields from ReferralResponse [cite: 164]
             "id": resp.id,
             "referral_id": resp.referral_id,
+            "referral_number": ref.referral_number,
             "hospital_name": resp.hospital_name,
             "response_status": resp.response_status,
             "seen_at": resp.seen_at,
@@ -214,6 +232,7 @@ def get_incoming_referrals(
             "created_at": ref.created_at,
             "referring_facility": ref.referring_facility,
             "disease_severity": ref.disease_severity,
+            **urgency_fields(ref),
             "patient_id": readable_patient_id,  # ◄── This now securely decrypted! [cite: 87]
             "patient_age": ref.patient.age,  # Eager-loaded from PatientRecords [cite: 164]
             "patient_age_months": ref.patient.age_months,
@@ -224,7 +243,9 @@ def get_incoming_referrals(
             "consent_status": ref.consent_status,
             "consent_method": ref.consent_method,
             "diagnosis": ref.diagnosis,
+            **diagnosis_fields(ref),
             "chief_complaint": ref.chief_complaint,
+            **complaint_fields(ref),
             "is_pwd": ref.is_pwd,
             "is_pregnant": ref.is_pregnant,
             "is_senior_citizen": ref.is_senior_citizen,
@@ -307,19 +328,25 @@ async def respond_to_referral(
             detail="Invalid decision. Must be 'ACCEPTED' or 'REDIRECTED'."
         )
 
-    # 1. Fetch the corresponding alert row from the response pool
-    alert = db.query(ReferralResponse).filter(
-        ReferralResponse.referral_id == referral_id,
-        ReferralResponse.hospital_name == hospital_name
-    ).first()
-
-    if not alert:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Referral alert not found for this facility."
-        )
-
     try:
+        # Serialize cancellation and response decisions on the same master row.
+        # An open browser modal is not proof that the referral is still active.
+        referral = db.query(Referral).filter(Referral.referral_id == referral_id).with_for_update().first()
+        if not referral:
+            raise HTTPException(404, "This referral is no longer available.")
+        alert = db.query(ReferralResponse).filter(
+            ReferralResponse.referral_id == referral_id,
+            ReferralResponse.hospital_name == hospital_name
+        ).with_for_update().first()
+        if not alert:
+            raise HTTPException(404, "Referral alert not found for this facility.")
+        if referral.status == "CANCELLED":
+            action = "accept" if payload.decision == "ACCEPTED" else "redirect"
+            raise HTTPException(409, f"Unable to {action}. The referring hospital cancelled this referral.")
+        if referral.receiving_facility or referral.departed_at or referral.status not in ("CREATED", "PENDING", "SEEN"):
+            raise HTTPException(409, "This referral is no longer available for a decision. Refresh your referral list.")
+        if alert.response_status != "PENDING":
+            raise HTTPException(409, "A decision has already been recorded or this referral is no longer available. Refresh your referral list.")
         # 2. Update status and save compliance metrics [cite: 315, 316]
         alert.response_status = payload.decision
         alert.responded_at = datetime.now(timezone.utc)
@@ -332,7 +359,6 @@ async def respond_to_referral(
 
         db.commit()
 
-        referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
         if referral:
             await manager.broadcast_to_facility(referral.referring_facility, {
                 "type": "REFERRAL_ACCEPTED" if payload.decision == "ACCEPTED" else "REFERRAL_REDIRECTED",
@@ -351,11 +377,14 @@ async def respond_to_referral(
             "redirect_reason_text": alert.redirect_reason_text,
         }
 
-    except Exception as e:
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database update failed: {str(e)}"
+            detail="Unable to save the referral decision. Please try again."
         )
 @router.post("/api/v1/referral/initiate", response_model=ReferralResponseSchema)
 async def initiate_referral(
@@ -369,33 +398,25 @@ async def initiate_referral(
     """
     try:
         # Step A: Encrypt the patient ID
+        clinical = parse_clinical_bundle(payload, referring_hospital)
         encrypted_fhir_id = aes_encrypt(payload.patient_record.id)
 
         # Step B: Calculate Patient Age
-        birth_date = datetime.strptime(payload.patient_record.birthDate, "%Y-%m-%d")
-        current_date = datetime.now()
-        calculated_age = current_date.year - birth_date.year - (
-                (current_date.month, current_date.day) < (birth_date.month, birth_date.day)
-        )
+        calculated_age = payload.age_years
         # Precise age in whole months -- `calculated_age` alone floors to 0 for any infant
         # under a year, which isn't clinically useful on a triage alert (a newborn and an
         # 11-month-old would look identical)
-        calculated_age_months = (
-            (current_date.year - birth_date.year) * 12 + (current_date.month - birth_date.month)
-            - (1 if current_date.day < birth_date.day else 0)
-        )
+        calculated_age_months = payload.age_months
         # Precise age in whole days -- `calculated_age_months` alone floors to 0 for any
         # newborn under a month old, so a 1-day-old and a 29-day-old would otherwise look
         # identical too (both show "0 months old")
-        calculated_age_days = (current_date.date() - birth_date.date()).days
+        calculated_age_days = payload.age_days
         patient_gender = getattr(payload.patient_record, "gender", "unknown") or "unknown"
         clinical_reason = "No reason provided"
         diagnosis_text = None
         referral_reason_values = []
         if payload.reasonCode and len(payload.reasonCode) > 0:
             clinical_reason = payload.reasonCode[0].text
-            if payload.reasonCode[0].coding and len(payload.reasonCode[0].coding) > 0:
-                diagnosis_text = payload.reasonCode[0].coding[0].display
             for index, reason in enumerate(payload.reasonCode):
                 reason_code = None
                 if reason.coding and len(reason.coding) > 0:
@@ -445,6 +466,8 @@ async def initiate_referral(
                 if "salary" in ext.url:
                     patient_salary = float(ext.valueDecimal)
                 elif "severity" in ext.url:
+                    if ext.valueDecimal is None or ext.valueDecimal != int(ext.valueDecimal):
+                        raise HTTPException(422, 'Legacy triage severity must be a whole number from 1 to 5.')
                     patient_severity = int(ext.valueDecimal)
                 elif "latitude" in ext.url:
                     patient_lat = float(ext.valueDecimal)
@@ -537,12 +560,7 @@ async def initiate_referral(
             consent_document_sha256 = (consent_document_sha256 or "").strip().lower()
             if consent_signer_type not in {"PATIENT", "PARENT_GUARDIAN", "AUTHORIZED_REPRESENTATIVE"}:
                 raise HTTPException(status_code=422, detail="Electronic consent has an invalid signer type.")
-            if not consent_signer_name or len(consent_signer_name) > 255:
-                raise HTTPException(status_code=422, detail="Electronic consent requires the signer's full name.")
-            if consent_signer_type != "PATIENT" and (
-                not consent_representative_relationship or len(consent_representative_relationship) > 100
-            ):
-                raise HTTPException(status_code=422, detail="Electronic consent requires the representative relationship.")
+            # Signer identity and the signature/name checks remain at the sending hospital.
             if len(consent_document_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in consent_document_sha256):
                 raise HTTPException(status_code=422, detail="Electronic consent requires a valid SHA-256 document hash.")
         else:
@@ -553,31 +571,39 @@ async def initiate_referral(
 
         # Step C.0: Derive which specific facility capabilities (dialysis, OB delivery,
         # neurology, etc.) this diagnosis requires, on top of the baseline severity tier
+        urgency = resolve_urgency(payload, patient_severity)
+        patient_severity = int(urgency['triage_code'])
         all_reason_text = " ".join(reason["label"] for reason in referral_reason_values)
-        required_capabilities = derive_required_capabilities(diagnosis_text, chief_complaint, all_reason_text or clinical_reason)
+        diagnosis = await resolve_diagnosis(payload.diagnosis_concept, diagnosis_text)
+        complaint = await resolve_chief_complaint(payload.chief_complaint_concept, chief_complaint)
+        chief_complaint = complaint['chief_complaint']
+        if clinical:
+            for entry in clinical['entries']:
+                if entry['resource']['resourceType'] == 'Encounter':
+                    canonical_complaint = {'text': complaint['chief_complaint_text']} if complaint['chief_complaint_text'] else {}
+                    if complaint['chief_complaint_code']:
+                        canonical_complaint['coding'] = [{'system': complaint['chief_complaint_system'],
+                            'code': complaint['chief_complaint_code'], 'display': complaint['chief_complaint_display']}]
+                    entry['resource']['reasonCode'] = [canonical_complaint]
+            values=clinical['vitals']
+            vital_bp=values.get('vital_bp'); vital_hr=values.get('vital_hr'); vital_rr=values.get('vital_rr')
+            vital_temp_c=values.get('vital_temp_c'); vital_o2sat=values.get('vital_o2sat')
+            vital_height_cm=values.get('vital_height_cm'); vital_weight_kg=values.get('vital_weight_kg')
+            condition=clinical['condition']
+            if condition:
+                condition['code']={'text':diagnosis['diagnosis_text']} if diagnosis['diagnosis_text'] else {}
+                if diagnosis['diagnosis_code']: condition['code']['coding']=[{'system':diagnosis['diagnosis_system'],
+                    'code':diagnosis['diagnosis_code'],'display':diagnosis['diagnosis_display']}]
+                if urgency['condition_severity_code']: condition['severity']={'coding':[{'system':urgency['condition_severity_system'],
+                    'code':urgency['condition_severity_code'],'display':urgency['condition_severity_display']}]}
+            clinical['request']['priority']=urgency['referral_priority']
+        diagnosis_text = diagnosis["diagnosis"]
+        required_capabilities = derive_required_capabilities(
+            diagnosis_text, chief_complaint, all_reason_text or clinical_reason,
+            diagnosis_system=diagnosis["diagnosis_system"], diagnosis_code=diagnosis["diagnosis_code"])
 
-        # Step C.1: Derive an anonymized, non-reversible patient_code (SHA-256 of Full Name +
-        # Birthdate + Sex) so the central IoL can track active-referral state network-wide
-        # without ever persisting the patient's identity [cite: 13, 110, 184].
-        given_name = payload.patient_record.name[0].given[0] if payload.patient_record.name and payload.patient_record.name[0].given else ""
-        family_name = payload.patient_record.name[0].family if payload.patient_record.name else ""
-        patient_code = hash_patient_code(given_name, family_name, payload.patient_record.birthDate, patient_gender)
-
-        # Step C.1b: Encrypt the patient's full identity for storage on this Referral row only --
-        # never on PatientRecords. Only ever decrypted by the finalized receiving facility via
-        # GET /api/v1/referral/{id}/patient-details.
-        full_name = (payload.subject.display or f"{given_name} {family_name}".strip()) if payload.subject else f"{given_name} {family_name}".strip()
-        if consent_method == "ELECTRONIC" and consent_signer_type == "PATIENT" and consent_signer_name.casefold() != full_name.casefold():
-            raise HTTPException(status_code=422, detail="A patient signature must use the selected patient's full name.")
-        encrypted_full_name = aes_encrypt(full_name) if full_name else None
-        encrypted_dob = aes_encrypt(payload.patient_record.birthDate) if payload.patient_record.birthDate else None
-        encrypted_phone = aes_encrypt(patient_phone) if patient_phone else None
-        encrypted_address = aes_encrypt(patient_address) if patient_address else None
-        encrypted_civil_status = aes_encrypt(patient_civil_status) if patient_civil_status else None
-        encrypted_philhealth_number = aes_encrypt(patient_philhealth_number) if patient_philhealth_number else None
-        encrypted_philhealth_status = aes_encrypt(patient_philhealth_status) if patient_philhealth_status else None
-        encrypted_consent_signer_name = aes_encrypt(consent_signer_name) if consent_signer_name else None
-        encrypted_consent_relationship = aes_encrypt(consent_representative_relationship) if consent_representative_relationship else None
+        # The hospital derives its pseudonymous token locally; central receives no identity.
+        patient_code = payload.patient_token
 
         # Step C.2: Block a second active referral for the same patient anywhere in the network.
         candidate_referrals = db.query(Referral).filter(
@@ -631,22 +657,27 @@ async def initiate_referral(
 
         # Step E: Insert transactional log to 'referrals'
         new_referral = Referral(
+            referral_number=next_referral_number(db),
             patient_id=encrypted_fhir_id,
             patient_code=patient_code,              # Anonymized SHA-256 identity for network-wide active-referral tracking
             referring_facility=referring_hospital,  # Resolved dynamically from PostgreSQL!
             receiving_facility=None,                # Left NULL for the AI process
             disease_severity=str(patient_severity),
+            **urgency,
             clinical_reason=clinical_reason,
-            diagnosis=diagnosis_text,
-            chief_complaint=chief_complaint,
+            **diagnosis,
+            **complaint,
+            fhir_condition_id=clinical['condition']['id'] if clinical and clinical['condition'] else None,
+            fhir_service_request_id=clinical['request']['id'] if clinical else None,
             required_capability=",".join(required_capabilities) if required_capabilities else None,
-            patient_full_name=encrypted_full_name,
-            patient_dob=encrypted_dob,
-            patient_phone=encrypted_phone,
-            patient_address=encrypted_address,
-            patient_civil_status=encrypted_civil_status,
-            patient_philhealth_number=encrypted_philhealth_number,
-            patient_philhealth_status=encrypted_philhealth_status,
+            # Direct identity stays at hospitals and is never written here.
+            patient_full_name=None,
+            patient_dob=None,
+            patient_phone=None,
+            patient_address=None,
+            patient_civil_status=None,
+            patient_philhealth_number=None,
+            patient_philhealth_status=None,
             vital_bp=vital_bp,
             vital_hr=vital_hr,
             vital_rr=vital_rr,
@@ -665,18 +696,27 @@ async def initiate_referral(
             consent_recorded_at=consent_recorded_at,
             consent_witnessed_by=consent_witnessed_by,
             consent_signer_type=consent_signer_type,
-            consent_signer_name=encrypted_consent_signer_name,
-            consent_representative_relationship=encrypted_consent_relationship,
+            consent_signer_name=None,
+            consent_representative_relationship=None,
             consent_document_sha256=consent_document_sha256,
             status="CREATED",
             created_at=datetime.now(timezone.utc)
         )
         db.add(new_referral)
         db.flush()
+        if clinical:
+            persist_resources(db,new_referral.referral_id,clinical['entries'])
+            persist_observations(db,new_referral.referral_id,clinical['observations'])
+        # Direct identity is retained only by hospitals; no new central vault package.
         for reason in referral_reason_values:
             db.add(ReferralReason(referral_id=new_referral.referral_id, **reason))
 
         # Step F: Atomic Commit
+        actor = payload.clinical_actor
+        db.add(ReferralUrgencyAudit(referral_id=new_referral.referral_id, facility=referring_hospital,
+            actor_user_id=actor.user_id if actor else 'legacy-system', actor_role=actor.role if actor else 'SYSTEM',
+            event_type='INITIAL_ASSIGNMENT', reason=payload.priority_override_reason,
+            previous_values={'suggested_priority': urgency_policy()[1][urgency['triage_code']]}, new_values=urgency))
         db.commit()
         db.refresh(new_referral)
         qualified_hospitals = get_qualified_broadcast_targets(db, patient_severity, required_capabilities)
@@ -699,8 +739,11 @@ async def initiate_referral(
             await manager.broadcast_to_facility(hospital_name, {
                 "type": "NEW_REFERRAL",
                 "referral_id": new_referral.referral_id,
+                "referral_number": new_referral.referral_number,
                 "referring_facility": referring_hospital,
                 "disease_severity": patient_severity,
+                **urgency,
+                "immediate_notification": patient_severity >= 3 or urgency['condition_severity_code'] == '24484000',
                 "created_at": new_referral.created_at.isoformat() if new_referral.created_at else None,
             })
 
@@ -708,7 +751,8 @@ async def initiate_referral(
             status="success",
             message="Referral securely verified, split, and logged in the central IoL queue.",
             referral_tracking_id=new_referral.referral_id,
-            referral_id=new_referral.referral_id
+            referral_id=new_referral.referral_id,
+            referral_number=new_referral.referral_number
         )
 
 
@@ -723,8 +767,20 @@ async def initiate_referral(
 @router.get("/api/v1/referral/{referral_id}/recommendations")
 def get_baseline_recommendations(
     referral_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    referring_hospital: str = Depends(get_current_hospital)
 ):
+    # 0. Only the hospital that initiated this referral may see which hospitals
+    # accepted it and how they rank against the patient.
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+    if not referral:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referral not found.")
+    if referral.referring_facility.strip().casefold() != referring_hospital.strip().casefold():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view recommendations for referrals your own hospital initiated."
+        )
+
     # 1. Grab all response records where the hospital clicked ACCEPT
     accepted_responses = db.query(ReferralResponse).filter(
         ReferralResponse.referral_id == referral_id,
@@ -745,8 +801,7 @@ def get_baseline_recommendations(
 
     # 5. Resolve the patient behind this referral so the FCM engine has
     # something to match the hospitals against (severity, coordinates, budget)
-    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
-    patient = referral.patient if referral else None
+    patient = referral.patient
 
     # 5b. Bed counts live on FacilityCapability, not Facility -- no ORM relationship
     # links them, so resolve it with an explicit lookup keyed by facility_id, and stamp
@@ -760,7 +815,13 @@ def get_baseline_recommendations(
     for h in hospitals:
         h.functional_beds = capability_by_facility_id[h.id].functional_beds if h.id in capability_by_facility_id else 0
 
-    if patient and hospitals:
+    emergency = (referral.triage_code or referral.disease_severity) == '5'
+    if emergency:
+        eligible = {h.id for h in get_qualified_broadcast_targets(db, 5,
+            (referral.required_capability or '').split(',') if referral.required_capability else [])}
+        hospitals = order_emergency_candidates(patient, [h for h in hospitals if h.id in eligible], capability_by_facility_id)
+        scores = {}
+    elif patient and hospitals:
         scores = compute_compatibility_scores(patient, hospitals)
     else:
         scores = {h.facility_name: 1.0 / len(hospitals) if hospitals else 1.0 for h in hospitals}
@@ -775,11 +836,48 @@ def get_baseline_recommendations(
             "available_beds": capability.functional_beds if capability else 0,
             "latitude": h.latitude,
             "longitude": h.longitude,
-            "matching_degree": scores.get(h.facility_name, 0.0)
+            "matching_degree": scores.get(h.facility_name, 0.0),
+            "ranking_method": 'DETERMINISTIC_EMERGENCY' if emergency else 'AI_FCM',
         })
 
-    ranked_list.sort(key=lambda x: x["matching_degree"], reverse=True)
+    if not emergency:
+        ranked_list.sort(key=lambda x: x["matching_degree"], reverse=True)
     return ranked_list
+
+
+class UrgencyReassessment(ClinicalUrgencyRequest):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+@router.patch('/api/v1/referral/{referral_id}/clinical-urgency')
+async def reassess_clinical_urgency(referral_id: str, payload: UrgencyReassessment,
+    db: Session = Depends(get_db), hospital: str = Depends(get_current_hospital)):
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).with_for_update().first()
+    if not referral:
+        raise HTTPException(404, 'Referral not found.')
+    if referral.receiving_facility != hospital:
+        raise HTTPException(403, 'Only the selected receiving facility may reassess triage.')
+    if referral.departed_at or referral.status == 'CANCELLED':
+        raise HTTPException(409, 'This referral is closed.')
+    if not payload.triage or not payload.reason.strip() or len(payload.reason) > 500:
+        raise HTTPException(422, 'Doctor-assigned triage and a reassessment reason are required.')
+    values = resolve_urgency(payload)
+    previous = urgency_fields(referral)
+    previous['legacy_triage'] = referral.disease_severity
+    for key, value in values.items(): setattr(referral, key, value)
+    referral.disease_severity = values['triage_code']
+    if referral.patient: referral.patient.severity = int(values['triage_code'])
+    sync_clinical_urgency(db,referral)
+    db.add(ReferralUrgencyAudit(referral_id=referral_id, facility=hospital,
+        actor_user_id=payload.clinical_actor.user_id, actor_role=payload.clinical_actor.role,
+        event_type='REASSESSMENT', reason=payload.reason.strip(), previous_values=previous,
+        new_values={**values, 'priority_override_reason': payload.priority_override_reason}))
+    db.commit()
+    for facility in {hospital, referral.referring_facility}:
+        await manager.broadcast_to_facility(facility, {'type': 'CLINICAL_URGENCY_UPDATED',
+            'referral_id': referral_id, **values,
+            'immediate_notification': int(values['triage_code']) >= 3 or values['condition_severity_code'] == '24484000'})
+    return {'status': 'success', **values}
 
 
 def _compute_referral_status(referral: Referral, responses: list[ReferralResponse]) -> str:
@@ -900,14 +998,20 @@ def get_my_referrals(
 
         results.append({
             "referral_id": ref.referral_id,
+            "referral_number": ref.referral_number,
             "patient_id": readable_patient_id,
             "disease_severity": ref.disease_severity,
             "clinical_reason": ref.clinical_reason or "No reason provided",
+            **urgency_fields(ref),
             "referral_reasons": _serialize_referral_reasons(db, ref),
             "consent_status": ref.consent_status,
             "consent_method": ref.consent_method,
             "consent_text_version": ref.consent_text_version,
+            "diagnosis": ref.diagnosis,
+            **diagnosis_fields(ref),
             "consent_recorded_at": ref.consent_recorded_at,
+            "chief_complaint": ref.chief_complaint,
+            **complaint_fields(ref),
             "consent_witnessed_by": ref.consent_witnessed_by,
             "status": status_value,
             "cancellable": status_value not in (
@@ -952,7 +1056,7 @@ async def cancel_referral(
     to CANCELLED so it drops off other hospitals' /incoming polling.
     """
     try:
-        referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+        referral = db.query(Referral).filter(Referral.referral_id == referral_id).with_for_update().first()
 
         if not referral:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referral not found.")
@@ -1141,21 +1245,49 @@ def get_referral_patient_details(
         except Exception:
             return None
 
+    transfer_id = aes_decrypt(referral.patient_id)
+    direct_transfer = None
+    if transfer_id.startswith("tx_"):
+        source = db.query(Facility).filter(Facility.facility_name == referral.referring_facility).first()
+        recipient = db.query(Facility).filter(Facility.facility_name == referral.receiving_facility).first()
+        try:
+            direct_transfer = issue_ticket(referral_id, transfer_id, source.facility_code, recipient.facility_code)
+        except (ValueError, OSError, KeyError) as exc:
+            raise HTTPException(status_code=503, detail="Hospital direct-transfer configuration is unavailable.") from exc
+
+    try:
+        vaulted_identity = {} if direct_transfer else (load_patient_identity(referral_id) or {})
+    except PatientIdentityVaultError as exc:
+        raise HTTPException(status_code=500, detail="The temporary patient identity package is unavailable.") from exc
+
+    # Legacy referrals continue reading the old encrypted PostgreSQL columns;
+    # Direct-transfer referrals return authorization and routing metadata only.
+    def identity_value(key, legacy_value):
+        return vaulted_identity.get(key) if key in vaulted_identity else safe_decrypt(legacy_value)
+
     return {
+        "patient_transfer": direct_transfer,
         "referral_id": referral.referral_id,
-        "full_name": safe_decrypt(referral.patient_full_name),
-        "date_of_birth": safe_decrypt(referral.patient_dob),
-        "phone": safe_decrypt(referral.patient_phone),
-        "address": safe_decrypt(referral.patient_address),
-        "civil_status": safe_decrypt(referral.patient_civil_status),
-        "philhealth_number": safe_decrypt(referral.patient_philhealth_number),
-        "philhealth_status": safe_decrypt(referral.patient_philhealth_status),
+        "referral_number": referral.referral_number,
+        "full_name": identity_value("full_name", referral.patient_full_name),
+        "date_of_birth": identity_value("date_of_birth", referral.patient_dob),
+        "phone": identity_value("phone", referral.patient_phone),
+        "address": identity_value("address", referral.patient_address),
+        "civil_status": identity_value("civil_status", referral.patient_civil_status),
+        "philhealth_number": identity_value("philhealth_number", referral.patient_philhealth_number),
+        "philhealth_status": identity_value("philhealth_status", referral.patient_philhealth_status),
         "gender": referral.patient.gender if referral.patient else None,
         "age": referral.patient.age if referral.patient else None,
         "age_months": referral.patient.age_months if referral.patient else None,
         "age_days": referral.patient.age_days if referral.patient else None,
         "diagnosis": referral.diagnosis,
+        **diagnosis_fields(referral),
         "chief_complaint": referral.chief_complaint,
+        **complaint_fields(referral),
+        "clinical_bundle": resource_bundle(db,referral.referral_id),
+        "observations": observation_details(db,referral.referral_id),
+        "fhir_condition_id": referral.fhir_condition_id,
+        "fhir_service_request_id": referral.fhir_service_request_id,
         "reason_text": referral.clinical_reason,
         "referral_reasons": _serialize_referral_reasons(db, referral),
         "attachments": [
@@ -1168,6 +1300,7 @@ def get_referral_patient_details(
             )
         ],
         "disease_severity": referral.disease_severity,
+        **urgency_fields(referral),
         "referring_facility": referral.referring_facility,
         "vital_bp": referral.vital_bp,
         "vital_hr": referral.vital_hr,
@@ -1181,6 +1314,7 @@ def get_referral_patient_details(
         "arrival_vital_rr": referral.arrival_vital_rr,
         "arrival_vital_temp_c": referral.arrival_vital_temp_c,
         "arrival_vital_o2sat": referral.arrival_vital_o2sat,
+        **arrival_value_snapshot(observation_details(db,referral.referral_id)),
         "arrived_at": referral.arrived_at,
         "is_pwd": referral.is_pwd,
         "is_pregnant": referral.is_pregnant,
@@ -1193,10 +1327,66 @@ def get_referral_patient_details(
         "consent_recorded_at": referral.consent_recorded_at,
         "consent_witnessed_by": referral.consent_witnessed_by,
         "consent_signer_type": referral.consent_signer_type,
-        "consent_signer_name": safe_decrypt(referral.consent_signer_name),
-        "consent_representative_relationship": safe_decrypt(referral.consent_representative_relationship),
+        "consent_signer_name": identity_value("consent_signer_name", referral.consent_signer_name),
+        "consent_representative_relationship": identity_value("consent_representative_relationship", referral.consent_representative_relationship),
         "consent_document_sha256": referral.consent_document_sha256,
     }
+
+
+@router.post("/api/v1/referral/{referral_id}/patient-details/acknowledge")
+def acknowledge_referral_patient_details(
+    referral_id: str,
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital),
+):
+    """Delete the temporary identity package after a successful local import."""
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Referral not found.")
+    if not referral.receiving_facility or referral.receiving_facility.strip().lower() != current_hospital_name.strip().lower():
+        raise HTTPException(status_code=403, detail="Only the finalized receiving facility may acknowledge patient identity delivery.")
+    if not referral.arrived_at:
+        raise HTTPException(status_code=409, detail="Patient identity delivery can be acknowledged only after arrival is recorded.")
+
+    deleted = delete_patient_identity(referral_id)
+    return {"status": "acknowledged", "identity_package_deleted": deleted}
+
+
+@router.get('/api/v1/referral/{referral_id}/clinical-bundle')
+def get_referral_clinical_bundle(referral_id: str, db: Session=Depends(get_db), hospital: str=Depends(get_current_hospital)):
+    referral=db.query(Referral).filter(Referral.referral_id==referral_id).first()
+    if not referral: raise HTTPException(404,'Referral not found.')
+    if hospital not in (referral.referring_facility,referral.receiving_facility):
+        raise HTTPException(403,'Only the sending or selected receiving facility can retrieve these resources.')
+    return resource_bundle(db,referral_id)
+
+
+@router.post("/api/v1/patient-transfer/validate")
+def validate_patient_transfer(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_hospital_name: str = Depends(get_current_hospital),
+):
+    """Sender checks current destination again immediately before releasing ciphertext."""
+    try:
+        claims = verify_ticket(payload.get("ticket", ""))
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Patient transfer authorization is invalid or expired.") from exc
+    referral = db.query(Referral).filter(Referral.referral_id == claims["referral_id"]).first()
+    if not referral or referral.referring_facility != current_hospital_name or not referral.receiving_facility:
+        raise HTTPException(status_code=403, detail="Patient transfer is not authorized for this sender.")
+    source = db.query(Facility).filter(Facility.facility_name == referral.referring_facility).first()
+    recipient = db.query(Facility).filter(Facility.facility_name == referral.receiving_facility).first()
+    if (not source or not recipient or source.facility_code != claims["source_code"]
+            or recipient.facility_code != claims["recipient_code"]
+            or aes_decrypt(referral.patient_id) != claims["transfer_id"]):
+        raise HTTPException(status_code=403, detail="Patient transfer destination has changed.")
+    try:
+        if facility_entry(recipient.facility_code)["encryption_public_key"] != claims["recipient_public_key"]:
+            raise ValueError("Recipient key changed")
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Patient transfer key is no longer valid.") from exc
+    return {"status": "authorized", "referral_id": referral.referral_id}
 
 
 @router.post("/api/v1/referral/{referral_id}/attachments", status_code=status.HTTP_201_CREATED)
@@ -1397,6 +1587,7 @@ def get_referral_outcomes(
 
         outcomes.append({
             "referral_id": ref.referral_id,
+            "referral_number": ref.referral_number,
             "outcome": outcome,
             "referring_facility": ref.referring_facility,
             "receiving_facility": ref.receiving_facility,
@@ -1533,7 +1724,7 @@ async def mark_referral_arrived(
     meaningfully during transport. Never required: marking arrival must not be blocked
     on filling in vitals.
     """
-    referral = db.query(Referral).filter(Referral.referral_id == referral_id).first()
+    referral = db.query(Referral).filter(Referral.referral_id == referral_id).with_for_update().first()
 
     if not referral:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referral not found.")
@@ -1545,7 +1736,14 @@ async def mark_referral_arrived(
         )
 
     if not referral.arrived_at:
-        referral.arrived_at = datetime.now(timezone.utc)
+        if referral.departed_at or referral.status == 'CANCELLED': raise HTTPException(409,'This referral is closed.')
+        arrived=datetime.now(timezone.utc)
+        if payload:
+            values={key:getattr(payload,key) for key in ('vital_bp','vital_hr','vital_rr','vital_temp_c','vital_o2sat','vital_height_cm','vital_weight_kg')}
+            if any(value is not None and value!='' for value in values.values()):
+                entries,rows=arrival_clinical_resources(db,referral,values,payload.observed_at or arrived,current_hospital_name,payload.oxygen_method)
+                persist_resources(db,referral_id,entries,'arrival'); persist_observations(db,referral_id,rows)
+        referral.arrived_at = arrived
 
         if payload:
             if payload.vital_bp:
@@ -1564,6 +1762,7 @@ async def mark_referral_arrived(
         await manager.broadcast_to_facility(referral.referring_facility, {
             "type": "PATIENT_ARRIVED",
             "referral_id": referral.referral_id,
+            "referral_number": referral.referral_number,
             "arrived_at": referral.arrived_at.isoformat(),
         })
 
@@ -1618,6 +1817,7 @@ async def mark_referral_departed(
     await manager.broadcast_to_facility(referral.referring_facility, {
         "type": "PATIENT_DEPARTED",
         "referral_id": referral.referral_id,
+        "referral_number": referral.referral_number,
         "departed_at": referral.departed_at.isoformat(),
         "departure_outcome": referral.departure_outcome,
     })

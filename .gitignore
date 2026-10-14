@@ -2,5 +2,7 @@
 .idea/
 storage/lto_files/
 storage/referral_attachments/
+storage/patient_identity_vault/
+storage/patient_transfer/
 __pycache__/
 *.pyc

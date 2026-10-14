@@ -16,7 +16,7 @@ _CAPABILITY_KEYWORDS: dict[str, list[str]] = {
 }
 
 
-def derive_required_capabilities(*texts: Optional[str]) -> list[str]:
+def derive_required_capabilities(*texts: Optional[str], diagnosis_system=None, diagnosis_code=None) -> list[str]:
     """
     Scans the given free-text clinical fields (diagnosis, chief complaint, reason)
     for keywords indicating the patient needs a specific facility capability beyond
@@ -24,11 +24,16 @@ def derive_required_capabilities(*texts: Optional[str]) -> list[str]:
     Returns the list of FacilityCapability column names that must be True.
     """
     combined = " ".join(t for t in texts if t).lower()
-    if not combined:
-        return []
-
-    return [
+    # Prototype code rules preserve existing capability categories; they are not
+    # treatment recommendations or a replacement for clinician assessment.
+    coded = {
+        "398254007": ["has_obgyn"],
+        "230690007": ["has_neurologist"],
+        "57054005": ["has_cardiologist"],
+        "74400008": ["has_general_surgeon"],
+    }.get(diagnosis_code, []) if diagnosis_system == "http://snomed.info/sct" else []
+    return sorted(set(coded + [
         capability
         for capability, keywords in _CAPABILITY_KEYWORDS.items()
         if any(keyword in combined for keyword in keywords)
-    ]
+    ]))

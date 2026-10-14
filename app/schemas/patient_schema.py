@@ -7,7 +7,7 @@ class FHIRPatient(BaseModel):
     id: str
     name: List[FHIRName]
     gender: Optional[str] = "unknown"
-    birthDate: str
+    birthDate: Optional[str] = None
 
     #AI Custom Variable
     extension:List[FHIRExtension]

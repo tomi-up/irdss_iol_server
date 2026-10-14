@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
-from sqlalchemy import ForeignKey, DateTime, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.db_connection import Base
@@ -15,6 +16,11 @@ class Referral(Base):
         primary_key=True,
         default=lambda: f"ref_{uuid.uuid4().hex[:12]}"
     )
+    # Human-readable number shown to staff (e.g. "REF-202610-00001"). The random
+    # referral_id above stays the system key used in URLs, foreign keys and the
+    # identity vault, so readable numbers never become guessable API handles.
+    # NULL for referrals created before this column existed.
+    referral_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, unique=True, index=True)
 
     # Foreign Key pointing back to the Patient table's fhir_id
     patient_id: Mapped[str] = mapped_column(
@@ -43,10 +49,10 @@ class Referral(Base):
     # that a candidate facility must have to be broadcast this referral
     required_capability: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
-    # AES-encrypted patient identity fields (see app.utils.security.aes_encrypt/aes_decrypt).
-    # Deliberately stored here on Referral, never on PatientRecords -- PatientRecords feeds
-    # the FCM matching engine and must stay non-identifying. These are only ever decrypted by
-    # GET /api/v1/referral/{id}/patient-details, gated on receiving_facility == caller.
+    # Legacy compatibility columns only. New referrals keep these NULL and place
+    # direct identity at the sending and receiving hospitals.
+    # They remain temporarily so referrals created before the privacy migration
+    # can still be read and moved out safely.
     patient_full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     patient_dob: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     patient_phone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -119,6 +125,92 @@ class Referral(Base):
     departure_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # DISCHARGED / TRANSFERRED / DECEASED / LEFT_AMA
     departure_remarks: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    # Phase 2 FHIR clinical coding foundation. These fields are intentionally
+    # nullable so existing referrals remain valid while legacy clients continue
+    # sending the original flat diagnosis, complaint, severity, and vital fields.
+    diagnosis_system: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    diagnosis_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    diagnosis_display: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    diagnosis_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    chief_complaint_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    chief_complaint_system: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    chief_complaint_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    chief_complaint_display: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    triage_system: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    triage_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    triage_display: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    referral_priority: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+
+    condition_severity_system: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    condition_severity_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    condition_severity_display: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    fhir_condition_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    fhir_service_request_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+
     # Bidirectional ORM relationship back to Patient
     # We reference the class name as a string to completely prevent circular imports!
     patient: Mapped["PatientRecords"] = relationship("PatientRecords", back_populates="referrals")
+    observations: Mapped[list["ReferralObservation"]] = relationship(
+        "ReferralObservation",
+        back_populates="referral",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ReferralObservation(Base):
+    """Normalized FHIR Observation values linked to a referral.
+
+    Existing ``vital_*`` columns remain in place during the compatibility
+    phases. Multiple rows may share a FHIR Observation id, which supports the
+    systolic and diastolic components of one blood-pressure Observation.
+    """
+
+    __tablename__ = "referral_observations"
+    __table_args__ = (
+        Index(
+            "ix_referral_observations_referral_context",
+            "referral_id",
+            "measurement_context",
+        ),
+        Index(
+            "ix_referral_observations_referral_loinc",
+            "referral_id",
+            "loinc_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    referral_id: Mapped[str] = mapped_column(
+        ForeignKey("referrals.referral_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    fhir_observation_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    loinc_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    display: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    value_numeric: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4), nullable=True)
+    unit_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    unit_display: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    measurement_context: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="referral",
+    )
+    observed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    referral: Mapped["Referral"] = relationship("Referral", back_populates="observations")
+
+
+class ReferralNumberSequence(Base):
+    """Per-month counter backing Referral.referral_number (period is YYYYMM, Philippine time)."""
+    __tablename__ = "referral_number_sequences"
+    period: Mapped[str] = mapped_column(String(6), primary_key=True)
+    last_value: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -1,0 +1,27 @@
+{
+  "resourceType": "ValueSet",
+  "id": "irdss-referral-diagnosis",
+  "url": "https://irdss.gov.ph/fhir/ValueSet/referral-diagnosis",
+  "version": "0.1.0",
+  "status": "draft",
+  "experimental": true,
+  "compose": {
+    "include": [
+      {
+        "system": "http://snomed.info/sct",
+        "concept": [
+          {"code": "233604007", "display": "Pneumonia"},
+          {"code": "398254007", "display": "Pre-eclampsia"},
+          {"code": "38362002", "display": "Dengue"},
+          {"code": "195967001", "display": "Asthma"},
+          {"code": "73211009", "display": "Diabetes mellitus"},
+          {"code": "38341003", "display": "Hypertensive disorder"},
+          {"code": "230690007", "display": "Cerebrovascular accident"},
+          {"code": "57054005", "display": "Acute myocardial infarction"},
+          {"code": "74400008", "display": "Appendicitis"},
+          {"code": "91302008", "display": "Sepsis"}
+        ]
+      }
+    ]
+  }
+}
